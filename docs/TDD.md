@@ -10,15 +10,19 @@
 alchemist/
 ├── core/
 │   ├── schemas.py        — UserTask, Leaderboard, ResearchResult, ExperimentState
-│   ├── llm.py            — LLMClient ABC, MockLLMClient, safe_llm_call
+│   ├── llm.py            — LLMClient ABC, MockLLMClient, ClaudeCLIClient, CodexCLIClient
+│   ├── executor.py       — TrainingExecutor (LocalExecutor, AWSExecutor)
 │   └── utils.py          — safe_asdict (enum 직렬화)
 ├── agents/
 │   ├── protocol.py       — AgentMessage, MessageBus, make_directive/response
 │   ├── benchmark.py      — BenchmarkAgent (모델 탐색 + 순위화)
-│   ├── research.py       — ResearchAgent (HP 탐색 + 오토 리서치)
-│   └── controller.py     — ControllerAgent (통제 + Safety + Registry)
+│   ├── research.py       — ResearchAgent (SoTA 탐색 + NAS + HP 탐색 + 자율 개선)
+│   └── controller.py     — ControllerAgent (통제 + Safety + Ship 판정)
 ├── harness.py            — ThreeAgentHarness (통합 오케스트레이터)
-└── main.py               — CLI 엔트리포인트
+├── main.py               — CLI 엔트리포인트
+├── export_dashboard.py   — Dashboard JSON 변환
+├── nas_worker.py         — EC2 NAS 학습 워커 (ViT/Swin/Mamba 포함)
+└── train_worker.py       — EC2 학습 워커 (ResNet 중심)
 ```
 
 ### 테스트 레벨
@@ -37,9 +41,11 @@ alchemist/
 |------|-----------|-----------|
 | core/schemas.py | test_agents.py, test_edge_cases.py | Unit |
 | core/llm.py | test_edge_cases.py::TestLLMEdgeCases | Unit |
+| core/executor.py | (LocalExecutor는 기존 테스트에서 검증) | Unit |
 | agents/protocol.py | test_protocol.py | Unit |
 | agents/benchmark.py | test_agents.py::TestBenchmarkAgent | Unit |
 | agents/research.py | test_agents.py::TestResearchAgent | Unit |
+| agents/research.py (SoTA) | test_agents.py::TestResearchAgent (SoTA 메서드) | Unit |
 | agents/controller.py | test_agents.py::TestControllerAgent | Unit |
 | harness.py | test_harness.py | Integration + E2E |
 | (edge cases) | test_edge_cases.py | Unit + Integration |
@@ -78,6 +84,12 @@ alchemist/
 | `test_baseline_score_exists` | "dinov2_vitb14" | 60 ≤ score ≤ 85 |
 | `test_design_experiment_returns_configs` | max_trials=6 | len ≤ 6, 각 config에 lr 존재 |
 | `test_trials_respect_budget` | budget=0.01 hr | trials < 100 |
+| `test_search_sota_returns_knowledge` | task=cifar100 | SoTA 정보 포함 텍스트 반환 |
+| `test_analyze_sota_gap_identifies_missing` | score=93%, sota=96% | gap + 기법 제안 포함 |
+| `test_suggest_techniques_returns_configs` | sota + history | config 리스트 (len > 0) |
+| `test_design_with_sota_knowledge` | sota_knowledge 전달 | LLM 프롬프트에 SoTA 반영 |
+| `test_research_log_records_sota_search` | full run | "sota_search" phase 기록 존재 |
+| `test_research_log_records_gap_analysis` | full run | "sota_gap" phase 기록 존재 |
 
 **Controller Agent:**
 
