@@ -4,6 +4,8 @@ Responsibilities (AD-2):
 - Leaderboard 최고 모델을 base로 가져오기
 - 사용자 태스크 데이터로 실험 설계 (LLM)
 - HP 탐색 / 아키텍처 수정 / Fine-tuning
+- 외부 지식 탐색: SoTA 검색 + 최신 기법 수집 (LLM)
+- SoTA 대비 gap 분석 + 자동 기법 제안
 - 실험 결과 자체 분석 → 다음 실험 방향 결정 (내부 루프)
 - 전 과정 연구 로그 기록
 - 최종 성능 리포트 생성
@@ -109,11 +111,12 @@ class ResearchAgent:
     for the user's specific task via HP search, architecture modification,
     and iterative self-analysis loops.
 
-    Key difference from previous version:
-    - Research Agent autonomously analyzes its own results
-    - Decides next experiment direction based on self-analysis (LLM)
-    - Runs multiple rounds internally until satisfied or budget exhausted
-    - Records every decision and analysis in ResearchLog
+    Key capabilities:
+    - External knowledge: searches SoTA results and latest techniques via LLM
+    - Gap analysis: compares current results against SoTA and identifies missing techniques
+    - Auto technique suggestion: LLM proposes new optimizers, augmentations, pretrained weights
+    - Self-analysis loop: autonomously analyzes results and refines experiment design
+    - Research logging: records every decision, analysis, and SoTA insight
     """
 
     def __init__(
@@ -162,13 +165,20 @@ class ResearchAgent:
             "upstream_context": upstream_context[:300] if upstream_context else "",
         })
 
-        # 1. Baseline evaluation
+        # 1. External knowledge: search SoTA and latest techniques
+        sota_knowledge = self.search_sota(task)
+        self.research_log.record("sota_search", "external_knowledge", {
+            "task": task.name,
+            "sota_summary": sota_knowledge[:500],
+        })
+
+        # 2. Baseline evaluation
         baseline = self.evaluate_baseline(base_model, task)
         self.research_log.record("baseline", "evaluated", {
             "base_model": base_model, "score": round(baseline, 2),
         })
 
-        # 2. Iterative research loop: design → run → analyze → refine
+        # 3. Iterative research loop: design → run → analyze (with SoTA gap) → refine
         all_trials: list[TrialResult] = []
         total_budget_used = 0.0
         best_score = baseline
@@ -192,6 +202,7 @@ class ResearchAgent:
                 base_model, task, upstream_context,
                 prior_analysis=analysis_history,
                 remaining_trials=self.max_trials,
+                sota_knowledge=sota_knowledge,
                 round_num=round_num,
             )
             self.research_log.record("design", "experiment_designed", {
@@ -230,15 +241,26 @@ class ResearchAgent:
                 best_score = round_best.score
                 best_trial = round_best
 
-            # 2c. Self-analyze results
+            # 2c. Self-analyze results + SoTA gap analysis
             analysis = self.analyze_results(
                 base_model, task, baseline, all_trials, best_score, round_num,
             )
-            analysis_history.append(analysis)
+
+            # 2c-1. SoTA gap analysis: compare with external knowledge
+            gap_analysis = self.analyze_sota_gap(
+                task, best_score, sota_knowledge, all_trials, round_num,
+            )
+            full_analysis = analysis + "\n\n" + gap_analysis
+            analysis_history.append(full_analysis)
+
             self.research_log.record("analysis", "self_analysis", {
                 "analysis": analysis,
                 "current_best": round(best_score, 2),
                 "improvement": round(best_score - baseline, 2),
+            }, round_num)
+            self.research_log.record("analysis", "sota_gap", {
+                "gap_analysis": gap_analysis,
+                "current_best": round(best_score, 2),
             }, round_num)
 
             # 2d. Decide: continue or stop?
@@ -323,8 +345,9 @@ class ResearchAgent:
         prior_analysis: list[str] | None = None,
         remaining_trials: int | None = None,
         round_num: int = 1,
+        sota_knowledge: str = "",
     ) -> list[TrialConfig]:
-        """Design experiment search space. Uses LLM + prior analysis for refinement."""
+        """Design experiment search space. Uses LLM + prior analysis + SoTA knowledge."""
         if remaining_trials is None:
             remaining_trials = self.max_trials
 
@@ -347,6 +370,13 @@ class ResearchAgent:
                 f"\n\nContext from Benchmark & Controller Agents:\n{upstream_context}\n"
             )
 
+        sota_block = ""
+        if sota_knowledge:
+            sota_block = (
+                f"\n\nSoTA Knowledge (from external search):\n{sota_knowledge[:800]}\n"
+                f"Use this to identify techniques that could improve performance.\n"
+            )
+
         prompt = (
             f"You are a Research Agent (round {round_num}). "
             f"Design hyperparameter search for:\n"
@@ -356,7 +386,7 @@ class ResearchAgent:
             f"  Metric: {task.eval_metric}\n"
             f"  Constraints: {task.constraints}\n"
             f"  Remaining trial budget: {remaining_trials}\n"
-            f"{context_block}{prior_block}"
+            f"{context_block}{sota_block}{prior_block}"
             f"Suggest configurations to try."
         )
         safe_llm_call(self.llm, prompt, fallback={"configs": []})
@@ -442,7 +472,143 @@ class ResearchAgent:
         return configs
 
     # ------------------------------------------------------------------
-    # Self-Analysis (new)
+    # External Knowledge: SoTA Search + Gap Analysis + Technique Suggestion
+    # ------------------------------------------------------------------
+
+    def search_sota(self, task: UserTask) -> str:
+        """Search for SoTA results and latest techniques for the given task via LLM.
+
+        Returns a summary of SoTA knowledge that informs experiment design.
+        """
+        prompt = (
+            f"You are a computer vision research assistant. "
+            f"For the following task, provide:\n\n"
+            f"Task: {task.description} (dataset: {task.name}, {task.num_classes} classes, "
+            f"metric: {task.eval_metric})\n\n"
+            f"1. What are the current state-of-the-art (SoTA) results on this benchmark?\n"
+            f"   - Include model names, accuracy scores, and year\n"
+            f"   - Separate 'with pretraining' and 'without pretraining' results\n\n"
+            f"2. What techniques are most effective for this benchmark?\n"
+            f"   - Optimizers (SGD, AdamW, SAM, LAMB, etc.)\n"
+            f"   - LR schedules (cosine, OneCycleLR, warm restarts, etc.)\n"
+            f"   - Augmentation (Mixup, CutMix, RandAugment, AugMax, etc.)\n"
+            f"   - Regularization (label smoothing, dropout, stochastic depth, etc.)\n"
+            f"   - Architecture tricks (SE, CBAM, attention, etc.)\n"
+            f"   - Pretrained weights (ImageNet-1K vs 21K vs JFT, etc.)\n\n"
+            f"3. What are the key gaps between mid-range (90%) and top (96%) performance?\n\n"
+            f"Be concise and specific with numbers."
+        )
+        try:
+            result = self.llm.generate(prompt)
+            logger.info("SoTA search completed for task '%s'", task.name)
+            return result
+        except Exception as e:
+            logger.warning("SoTA search failed: %s", e)
+            return (
+                f"SoTA for {task.name}: "
+                f"Best with pretraining ~96% (EffNet-L2+SAM, JFT-300M). "
+                f"Best without pretraining ~86% (PyramidNet+CutMix). "
+                f"Key techniques: SAM optimizer, larger pretrained models, "
+                f"longer training, Mixup+CutMix, label smoothing, stochastic depth."
+            )
+
+    def analyze_sota_gap(
+        self,
+        task: UserTask,
+        current_best: float,
+        sota_knowledge: str,
+        all_trials: list[TrialResult],
+        round_num: int,
+    ) -> str:
+        """Analyze the gap between current results and SoTA, suggest specific improvements.
+
+        Returns actionable suggestions for the next round of experiments.
+        """
+        tried_techniques = set()
+        for t in all_trials:
+            cfg = t.config
+            tried_techniques.add(f"lr={cfg.lr}")
+            tried_techniques.add(f"adapter={cfg.adapter}")
+            tried_techniques.add(f"freeze={cfg.freeze_backbone}")
+            tried_techniques.add(f"scheduler={cfg.scheduler}")
+
+        prompt = (
+            f"You are a Research Agent analyzing the gap to SoTA.\n\n"
+            f"Task: {task.description} ({task.name}, {task.num_classes} classes)\n"
+            f"Current best score: {current_best:.2f}%\n"
+            f"Rounds completed: {round_num}\n"
+            f"Trials run: {len(all_trials)}\n\n"
+            f"Techniques already tried:\n{chr(10).join(sorted(tried_techniques))}\n\n"
+            f"SoTA knowledge:\n{sota_knowledge[:1000]}\n\n"
+            f"Analyze:\n"
+            f"1. How far is our result from SoTA? Is the gap significant?\n"
+            f"2. What specific techniques are we MISSING that SoTA uses?\n"
+            f"3. Rank the top 3 most impactful techniques we should try next.\n"
+            f"4. For each suggested technique, provide concrete config values.\n\n"
+            f"Be specific and actionable. Output format:\n"
+            f"GAP: X.X%\n"
+            f"MISSING TECHNIQUE 1: [name] — [config suggestion]\n"
+            f"MISSING TECHNIQUE 2: [name] — [config suggestion]\n"
+            f"MISSING TECHNIQUE 3: [name] — [config suggestion]"
+        )
+        try:
+            result = self.llm.generate(prompt)
+            logger.info("SoTA gap analysis (R%d): current=%.2f%%", round_num, current_best)
+            return f"[SoTA Gap Analysis]\n{result}"
+        except Exception:
+            gap = 96.0 - current_best
+            return (
+                f"[SoTA Gap Analysis]\n"
+                f"GAP: {gap:.1f}% (current {current_best:.1f}% vs SoTA ~96%)\n"
+                f"MISSING TECHNIQUE 1: SAM optimizer — use SAM(base_optimizer=AdamW, rho=0.05)\n"
+                f"MISSING TECHNIQUE 2: Larger pretrained — try ViT-L/14 or ConvNeXt-Large with IN-22K\n"
+                f"MISSING TECHNIQUE 3: Longer training — increase epochs to 50-100 with cosine decay"
+            )
+
+    def suggest_techniques(
+        self,
+        task: UserTask,
+        current_best: float,
+        sota_knowledge: str,
+        analysis_history: list[str],
+    ) -> list[dict[str, Any]]:
+        """LLM suggests new techniques to try based on SoTA gap analysis.
+
+        Returns list of technique configs that can be applied to experiment design.
+        """
+        history_summary = "\n---\n".join(analysis_history[-3:]) if analysis_history else "None"
+
+        prompt = (
+            f"Based on the SoTA analysis and experiment history, suggest 3-5 specific "
+            f"new configurations to try.\n\n"
+            f"Task: {task.name}, current best: {current_best:.2f}%\n\n"
+            f"SoTA knowledge:\n{sota_knowledge[:500]}\n\n"
+            f"Recent analysis:\n{history_summary[:500]}\n\n"
+            f"Return ONLY a JSON array of config objects. Each must have:\n"
+            f"lr (float), batch_size (int), epochs (int), freeze_backbone (bool), "
+            f"adapter (string), optimizer (string: 'adamw'/'sam'/'sgd'), "
+            f"scheduler (string), mixup (bool), cutmix (bool), "
+            f"extra_technique (string: description of any new technique)\n\n"
+            f"Focus on techniques NOT yet tried. Be creative but practical."
+        )
+        result = safe_llm_call(
+            self.llm, prompt,
+            fallback=[
+                {"lr": 0.0003, "batch_size": 64, "epochs": 50, "freeze_backbone": False,
+                 "adapter": "mlp", "optimizer": "sam", "scheduler": "cosine",
+                 "mixup": True, "cutmix": True, "extra_technique": "SAM optimizer"},
+                {"lr": 0.0001, "batch_size": 32, "epochs": 80, "freeze_backbone": False,
+                 "adapter": "mlp", "optimizer": "adamw", "scheduler": "cosine",
+                 "mixup": True, "cutmix": True, "extra_technique": "longer training + lower LR"},
+            ],
+        )
+        if isinstance(result, list):
+            logger.info("LLM suggested %d new techniques", len(result))
+            return result
+        return []
+
+    # ------------------------------------------------------------------
+    # Self-Analysis
     # ------------------------------------------------------------------
 
     def analyze_results(

@@ -48,11 +48,14 @@
          │ 추천 모델 + Leaderboard
    ┌─────▼───────────────────────────────────┐
    │ Phase 2: Research Agent                  │
-   │  1. 추천 모델을 base로 가져오기           │
-   │  2. HP 탐색 (LR, freeze, adapter 등)    │
-   │  3. 아키텍처 수정 + Fine-tuning          │
-   │  4. 반복 실험 → 최적 설정 도출            │
-   │  5. 최종 성능 리포트 반환                 │
+   │  1. SoTA 탐색: 최고 성능 + 기법 검색     │
+   │  2. 추천 모델을 base로 가져오기           │
+   │  3. SoTA 지식 기반 실험 설계              │
+   │  4. HP 탐색 + 아키텍처 탐색 (NAS)        │
+   │  5. 자체 분석 + SoTA gap 분석             │
+   │  6. 부족한 기법 자동 도입 (SAM 등)        │
+   │  7. 반복 개선 → 최적 설정 도출            │
+   │  8. 최종 성능 리포트 + SoTA 대비 포지셔닝  │
    └─────┬───────────────────────────────────┘
          │ 최적화된 모델 + 결과
    ┌─────▼─────┐
@@ -123,15 +126,72 @@ class UserTask:
 
 ```
 Research Agent
-├── Experiment Designer (LLM)
-│   └── 탐색 공간 설계 (HP 범위, 아키텍처 변형)
+├── External Knowledge (LLM) ← NEW
+│   ├── SoTA Search: 최신 벤치마크 최고 성능 + 기법 검색
+│   ├── Gap Analysis: 현재 결과 vs SoTA 차이 분석
+│   └── Technique Suggestion: 부족한 기법 자동 제안
+│       (optimizer: SAM, pretrained: IN-22K/JFT, 학습 전략 등)
+│
+├── Experiment Designer (LLM + SoTA Knowledge)
+│   ├── Round 1: 탐색 공간 설계 (HP 범위, 아키텍처 변형)
+│   └── Round 2+: SoTA gap 기반 targeted refinement
+│
+├── NAS (Architecture Search)
+│   ├── Phase 1: 다중 backbone 탐색 (CNN/ViT/Swin/Mamba)
+│   └── Phase 2: Top-K backbone 집중 HP 최적화
+│
+├── Self-Analysis Loop (LLM)
+│   ├── 실험 결과 패턴 분석 (어떤 HP가 효과적인지)
+│   ├── SoTA 대비 gap 분석 (부족한 기법 식별)
+│   └── 계속/중단 자율 판단
+│
 ├── HP Searcher (결정적)
-│   └── LR / batch size / freeze / adapter 조합 탐색
-├── Trainer (결정적)
-│   └── Fine-tuning 실행 + 평가
+│   └── LR / batch size / freeze / adapter / optimizer 조합 탐색
+│
+├── Trainer (결정적, Local or AWS GPU)
+│   └── Fine-tuning / Linear Probe 실행 + 평가
+│
+├── Research Log
+│   └── 전 과정 기록 (SoTA 검색, 분석, 설계, 실행, 판단)
+│
 └── Report Generator (LLM)
-    └── 최종 리포트 + 최적 설정 문서화
+    └── 최종 리포트 + SoTA 대비 포지셔닝 문서화
 ```
+
+**자율 개선 흐름:**
+
+```
+                    ┌─────────────────────────────────────┐
+                    │   External Knowledge (SoTA Search)   │
+                    │   "SoTA=96%, SAM+JFT-300M 사용"     │
+                    └──────────────┬──────────────────────┘
+                                   │
+                                   ▼
+    ┌──────────────────────────────────────────────────────┐
+    │  Round 1: 실험 설계 (SoTA 지식 반영)                  │
+    │  → 실행 → 자체 분석 + SoTA gap 분석                   │
+    │  → "현재 93%, SoTA 96%, GAP: SAM optimizer 미사용"   │
+    │  → 계속 판단: Yes (gap 존재)                          │
+    ├──────────────────────────────────────────────────────┤
+    │  Round 2: SoTA gap 기반 재설계                        │
+    │  → SAM optimizer 추가, 더 긴 학습, LR 조정            │
+    │  → 실행 → 분석 → gap 재평가                           │
+    │  → "94.5%, gap 줄어듦. Pretrained 크기가 병목"        │
+    ├──────────────────────────────────────────────────────┤
+    │  Round N: 더 이상 개선 불가 또는 예산 소진 → 종료      │
+    └──────────────────────────────────────────────────────┘
+```
+
+**핵심 메서드:**
+
+| 메서드 | 역할 | 입력 | 출력 |
+|--------|------|------|------|
+| `search_sota()` | 외부 SoTA 지식 수집 | task | SoTA 요약 텍스트 |
+| `analyze_sota_gap()` | 현재 결과 vs SoTA gap 분석 | score, sota, trials | gap 분석 + 기법 제안 |
+| `suggest_techniques()` | 미사용 기법 자동 제안 | sota, history | config 리스트 (JSON) |
+| `design_experiment()` | SoTA 반영 실험 설계 | sota, analysis | TrialConfig 리스트 |
+| `analyze_results()` | 자체 결과 패턴 분석 | trials | 분석 텍스트 |
+| `should_continue_research()` | 계속/중단 판단 | analysis, gap | bool |
 
 **핵심 스키마:**
 
