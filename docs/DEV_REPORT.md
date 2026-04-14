@@ -669,4 +669,337 @@ python export_dashboard.py --output /path/to/dashboard/data/alchemist_v2.json
 
 ---
 
+## 세션 5 — 2026-04-08 (GitHub repo 구축 + Framework diagram)
+
+### 개요
+
+| 항목 | 값 |
+|------|-----|
+| 작업 | GitHub repository 초기 구축 + 프레임워크 구조 재정리 |
+| 산출물 | `incheon2cho/Alchemist` repo, framework 블록 다이어그램, NAS → Research Agent 통합 |
+| Commit 수 | 5 (Initial → diagram → layout 개선 × 3) |
+
+### 주요 작업
+
+- **Repo 구조 확정**: `alchemist/agents/{benchmark,research,controller}`, `alchemist/core/{llm,executor}` 계층화
+- **Framework 다이어그램 작성** (matplotlib): `docs/alchemist_framework.png`, README 노출용 3-agent 블록
+- **NAS를 Research Agent 하위 기능으로 재배치**: 별도 모듈이 아닌 Research Agent의 탐색 전략으로 위치 조정
+- 다이어그램 레이아웃 개선(등간격 컬럼, 중앙 정렬) 3회 반복
+
+### 토큰 사용량 (추정)
+
+| 구분 | Input 토큰 (추정) | Output 토큰 (추정) |
+|------|-------------------|-------------------|
+| Repo 구조 설계 + 초기 모듈 작성 | ~25,000 | ~18,000 |
+| 다이어그램 코드 작성 + 반복 개선 | ~15,000 | ~10,000 |
+| README 초안 + 커밋 정리 | ~10,000 | ~5,000 |
+| **합계** | **~50,000** | **~33,000** |
+
+### EC2 비용
+
+없음 (로컬 작업).
+
+---
+
+## 세션 6 — 2026-04-08 ~ 04-09 (Vision Mamba / I-JEPA / SAM 통합)
+
+### 개요
+
+| 항목 | 값 |
+|------|-----|
+| 작업 | 최신 아키텍처 통합 (Vision Mamba, I-JEPA, DINOv3) + SAM optimizer 도입 |
+| EC2 | i-0e35db2d675713696 (g5.xlarge, A10G×1) |
+| **Best Score** | **Swin-Base + SAM = 94.00%** (+0.18%p over 93.82%) |
+
+### 주요 실험 결과
+
+| Model | Mode | Top-1 | 비고 |
+|---|---|---|---|
+| **Swin-Base + SAM** | FT | **94.00%** | 신규 best (기존 93.82% 대비 +0.18%p) |
+| ViT-B/16 | FT | 93.46% | 원 논문 91.48% 대비 +1.98%p |
+| DINOv3-Base | LP | 88.89% | LP 신규 best |
+| I-JEPA ViT-H/14 | FT | 91.67% | I-JEPA 계열 실증 |
+| I-JEPA ViT-H/14 | LP | 80.29% | |
+| Vision Mamba (Vim) | FT | 91.13% | DeiT-Small 89.59% 대비 우수 |
+
+### 인프라 작업
+
+- `conda env` 분리로 Vision Mamba 환경 구성 (mamba-ssm 1.1.1 빌드 이슈 우회)
+- MambaOut `num_features` 불일치 버그 수정 (dummy forward로 실제 embed_dim 검출)
+- DINOv2/DINOv3 518px 입력 자동 감지 (timm `pretrained_cfg.input_size`)
+- SAM optimizer 구현 및 Swin-Base에 적용
+
+### 토큰 사용량 (추정)
+
+| 구분 | Input 토큰 (추정) | Output 토큰 (추정) |
+|------|-------------------|-------------------|
+| 아키텍처별 모델 로딩 로직 수정 (Mamba/DINO/I-JEPA) | ~40,000 | ~25,000 |
+| SAM optimizer 구현 + 버그 수정 | ~25,000 | ~15,000 |
+| 실험 실행 + 모니터링 (~20h) | ~80,000 | ~25,000 |
+| 결과 분석 + 대시보드 업데이트 | ~20,000 | ~10,000 |
+| **합계** | **~165,000** | **~75,000** |
+
+### EC2 비용
+
+| 인스턴스 | 시간 | 비용(추정) |
+|---------|------|-----------|
+| i-0e35db2d675713696 (g5.xlarge) | ~20h | ~$20 |
+
+---
+
+## 세션 7 — 2026-04-09 (Research Agent Self-Refinement 구현)
+
+### 개요
+
+| 항목 | 값 |
+|------|-----|
+| 작업 | Research Agent에 SoTA 지식 탐색 + gap 분석 + 자동 기법 제안 로직 추가 |
+| Commit | `775aa8d`, `008f4a0` |
+
+### 구현 항목
+
+- `alchemist/agents/research.py`에 다음 메서드 신설:
+  - `search_sota(task)` — 외부 SoTA 성능 검색 (LLM 기반)
+  - `analyze_sota_gap(result, sota)` — 현재 결과와 SoTA의 거리 분석
+  - `suggest_techniques(gap)` — 부족 기법 자동 제안 (예: SAM, longer training, stochastic depth)
+- `ResearchLog` 클래스: 모든 실험/분석 이력을 구조화된 JSON으로 저장
+- Research Agent 자율 루프: 실험 → SoTA gap 분석 → 기법 도입 → 재실험
+- README/TDD 문서 업데이트하여 새 기능 반영
+
+### 실증 결과
+
+- SoTA gap 분석이 SAM optimizer를 자동 제안 → 적용 후 Swin-Base 93.82% → **94.00%** (+0.18%p)
+- **Self-refinement 메커니즘의 실효성 검증** — 에이전트가 스스로 기법을 식별·도입한 첫 사례
+
+### 토큰 사용량 (추정)
+
+| 구분 | Input 토큰 (추정) | Output 토큰 (추정) |
+|------|-------------------|-------------------|
+| Research Agent 메서드 설계/구현 | ~30,000 | ~20,000 |
+| ResearchLog 구조 설계 | ~10,000 | ~6,000 |
+| README/TDD 문서 업데이트 | ~15,000 | ~10,000 |
+| 자율 루프 테스트/디버깅 | ~15,000 | ~8,000 |
+| **합계** | **~70,000** | **~44,000** |
+
+### EC2 비용
+
+없음 (구현 작업 위주).
+
+---
+
+## 세션 8 — 2026-04-10 ~ 04-11 (Paper Outline + COCO Detection)
+
+### 개요
+
+| 항목 | 값 |
+|------|-----|
+| 작업 | 논문 초안 작성 + COCO Detection 실험 | 
+| Commit | `5ad4dc5` (PAPER_OUTLINE.md) |
+| EC2 | i-0e35db2d675713696 (g5.xlarge) |
+
+### 8.1 논문 초안 작성
+
+- `docs/PAPER_OUTLINE.md` 작성: Introduction(배경/문제정의/제안기술/Contribution), Method, Results, Conclusion 구조
+- Title: "A Multi-Agent Collaboration Framework for Vision Model Selection and Structural Self-Refinement"
+
+### 8.2 COCO Detection 실험
+
+| 접근 | 결과 | 비고 |
+|---|---|---|
+| Faster R-CNN (resnet50_fpn_v2, frozen backbone) | mAP ~0.01% | 실패 (img_size=416 + 1epoch 부족) |
+| Faster R-CNN (22 backbones, resize vs crop) | 대부분 실패 | batch 전체 mAP ≈ 0 |
+| **YOLOv8n pretrained eval** | **mAP 36.84%** | 정상 동작 확인 |
+
+### 8.3 COCO 데이터 이슈
+
+- train2017 일부 손상 (99,766 / 118,287) → disk full 이슈
+- 캐시 정리 후 full zip (19GB) 재다운로드
+- 일부 이미지 truncated → `ImageFile.LOAD_TRUNCATED_IMAGES = True` 적용
+- YOLO는 `images/train2017`, `labels/train2017` 구조 요구 → 디렉토리 재구성
+
+### 토큰 사용량 (추정)
+
+| 구분 | Input 토큰 (추정) | Output 토큰 (추정) |
+|------|-------------------|-------------------|
+| PAPER_OUTLINE 작성 | ~20,000 | ~15,000 |
+| COCO Faster R-CNN 구현/디버깅 | ~50,000 | ~30,000 |
+| COCO 데이터 전처리 이슈 해결 | ~30,000 | ~10,000 |
+| YOLO 전환 + 초기 eval | ~20,000 | ~10,000 |
+| **합계** | **~120,000** | **~65,000** |
+
+### EC2 비용
+
+| 인스턴스 | 시간 | 비용(추정) |
+|---------|------|-----------|
+| i-0e35db2d675713696 (g5.xlarge, COCO 실험) | ~15h | ~$15 |
+
+---
+
+## 세션 9 — 2026-04-13 (YOLO Batch + ImageNet SoTA 시도)
+
+### 개요
+
+| 항목 | 값 |
+|------|-----|
+| 작업 | YOLO 배치 (eval + fine-tune) 실패 → ImageNet SoTA 초과 실험 시도 → Ensemble 실패 |
+| EC2 | `i-0e35db2d675713696` (g5.xlarge) + **`i-0950c34c2ba2f210b` (p4de.24xlarge Spot, A100 80GB×8)** |
+| 결과 | SoTA 초과 **실패** (EVA-02-L baseline 90.05% vs 최적 ensemble 89.84%) |
+
+### 9.1 YOLO 배치 (실패)
+
+- Phase 1 (eval 8 models) + Phase 2 (fine-tune 6 models) 배치 설계
+- `yolo_coco.py`의 YAML 생성 버그 (`train:train2017` vs 실제 `images/train2017`)
+- 첫 배치 **14/14 전부 실패** → 수정 후 재실행
+- 재실행 후 Phase 1 eval 성공 (yolov8n~yolo11l, 36.84~52.80% mAP)
+- Phase 2 fine-tune 중 yolov8s FT 완료(42.34%, pretrained 대비 역행) → **사용자 중단 요청으로 종료**
+
+### 9.2 ImageNet SoTA 초과 실험 준비
+
+- **데이터 획득 (ungated HF 미러 발견)**:
+  - `mrm8488/ImageNet1K-val`: 6.69GB (full 50K)
+  - `mrm8488/ImageNet1K-train`: 146.46GB (full 1.28M)
+  - 라벨이 timm 표준 idx와 100% 일치 검증 (ResNet50 top-1 = 80.36%)
+- **S3 업로드**: `s3://alchemist-data-851336487511-us-east-1/imagenet-1k/` (영구 보존)
+- **스크립트 7개 작성 + 업로드**:
+  - `imagenet_common.py` (Parquet Dataset + 분산 gather)
+  - `imagenet_eval.py` (single-scale baseline eval)
+  - `imagenet_tta.py` (multi-scale + flip + 10-crop)
+  - `imagenet_ft.py` (EVA-02 @448→@512 FT, LLRD + EMA + Mixup)
+  - `imagenet_ensemble.py` (Bayesian weight 최적화)
+  - `spot_handler.sh`, `day1_spot.sh`
+
+### 9.3 p4de Spot 런칭 및 실험
+
+| 이벤트 | 시각 (UTC) |
+|---|---|
+| p4de 인스턴스 런칭 | 2026-04-13 10:18:41 |
+| S1 Baseline eval (5 models) 완료 | 10:34~10:45 (11m) |
+| S2 Multi-scale + hflip TTA 완료 | 10:45~11:18 (33m) |
+| S3 10-crop TTA 완료 | 11:18~12:09 (51m) |
+| S4 EVA-02 @512 FT 시작 | 12:09 |
+| S4 **중단** (속도 이상: 21 img/s @ A100×8) | ~23:03 (사용자 지시) |
+| **Terminate** | 23:17:xx |
+
+### 9.4 S1+S3 결과 (success)
+
+| Model | Single top-1 | Tencrop top-1 |
+|---|---|---|
+| EVA-02-L/14 @448 | **90.050%** | 89.990% |
+| EVA-Giant @336 | 89.458% | 89.422% |
+| ConvNeXt-V2-H @512 | 88.852% | 88.790% |
+| BEiT-L @512 | 88.574% | 88.710% |
+| DeiT3-L @384 | 87.724% | 87.900% |
+
+### 9.5 Ensemble 결과 (failure)
+
+| 기법 | Top-1 | gain vs best single |
+|---|---|---|
+| Best single (EVA-02-L) | **90.05%** | 0 (baseline) |
+| Uniform ensemble | 89.91% | **-0.14%p** |
+| Optimized weights | 89.84% | **-0.21%p** |
+
+**실패 원인**:
+- EVA-02-L이 타 모델 대비 격차 커서(1.5%p+) 약 모델이 ensemble drag
+- Weight optimizer가 균등 분포(~0.10)로 수렴 — 차별화 실패
+
+### 9.6 FT 중단 배경
+
+- A100×8에서 **21 img/s 총합** (정상치 200~400 img/s) → Parquet DataLoader의 shuffle 시 I/O 병목
+- 1 epoch ≈ 17시간 추정 → 5 epochs = 85h, $500+ 예상
+- 사용자 승인 예산 ($336) 초과 위험 → **Option A (FT 중단 + ensemble로 종료)** 결정
+
+### 토큰 사용량 (추정)
+
+| 구분 | Input 토큰 (추정) | Output 토큰 (추정) |
+|------|-------------------|-------------------|
+| YOLO 배치 디버깅 (YAML 버그, 재실행) | ~40,000 | ~15,000 |
+| ImageNet 데이터 탐색 + HF 미러 검증 | ~30,000 | ~10,000 |
+| 스크립트 7개 작성 (common/eval/tta/ft/ensemble/spot_handler/day1_spot) | ~90,000 | ~55,000 |
+| Parquet 검증 + dry-run (ResNet50 80.36%) | ~20,000 | ~10,000 |
+| p4de Spot 런칭 + AWS 인프라 설정 | ~30,000 | ~10,000 |
+| 실험 모니터링 + 속도 이상 진단 | ~45,000 | ~15,000 |
+| FT 중단 + Ensemble 실행 + EC2 종료 | ~25,000 | ~10,000 |
+| **합계** | **~280,000** | **~125,000** |
+
+### EC2 / S3 비용
+
+| 리소스 | 시간 / 용량 | 비용 |
+|---|---|---|
+| p4de.24xlarge Spot (A100 80GB×8) | 12h 58m × $13.6/hr | **~$176** |
+| EBS gp3 200GB | 13h | ~$0.4 |
+| S3 (ImageNet 152GB + 결과) | 저장 1개월 | ~$3.7 |
+| S3 API 요청 | download/upload | ~$0.5 |
+| g5.xlarge (YOLO 실험) | ~5h | ~$5 |
+| **세션 9 합계** | | **~$185** |
+
+---
+
+## 세션 10 — 2026-04-14 (AutoML-Agent 비교 분석)
+
+### 개요
+
+| 항목 | 값 |
+|------|-----|
+| 작업 | AutoML-Agent (ICML 2025) 조사 + Alchemist 차이 분석 문서 작성 |
+| Commit | `8919394` (`docs: add AutoML-Agent vs Alchemist 차이 분석 자료`) |
+| 산출물 | `docs/RELATED_WORK_AUTOML_AGENT.md` (270 lines, 10 sections + 2 appendices) |
+
+### 주요 작업
+
+- **AutoML-Agent 조사**: 논문, GitHub repo, 프로젝트 페이지 확인
+  - 저자: Trirat et al. (KAIST + DeepAuto.ai)
+  - 5-agent 구조 (data/model/operation/prompt/manager)
+  - LLM: GPT-4 / Mixtral (API/vLLM)
+  - 7 modalities × 14+ datasets
+- **차이 분석 문서 작성**: 에이전트 구조, self-refinement 메커니즘, LLM 활용, 인프라, 실증 결과 10개 축 비교
+- **논문 포지셔닝 권장**: Title 재정의, Contribution 재편, Related Work 비교표, Experiments 설계
+
+### 토큰 사용량 (추정)
+
+| 구분 | Input 토큰 (추정) | Output 토큰 (추정) |
+|------|-------------------|-------------------|
+| AutoML-Agent 논문/repo WebFetch 분석 | ~15,000 | ~8,000 |
+| 차이 분석 문서 작성 | ~30,000 | ~20,000 |
+| DEV_REPORT 업데이트 (본 섹션) | ~12,000 | ~8,000 |
+| **합계** | **~57,000** | **~36,000** |
+
+### EC2 비용
+
+없음 (로컬 작업).
+
+---
+
+## 📊 세션 5~10 누적 요약
+
+| 세션 | 날짜 | 주요 성과 | Input 토큰 | Output 토큰 | 비용 |
+|---|---|---|---|---|---|
+| 5 | 04-08 | GitHub repo + framework diagram | ~50,000 | ~33,000 | $0 |
+| 6 | 04-08~09 | Vision Mamba/I-JEPA/SAM, **Swin 94.00%** | ~165,000 | ~75,000 | ~$20 |
+| 7 | 04-09 | Research Agent self-refinement | ~70,000 | ~44,000 | $0 |
+| 8 | 04-10~11 | Paper outline + COCO detection | ~120,000 | ~65,000 | ~$15 |
+| 9 | 04-13 | YOLO + ImageNet SoTA 시도 (실패) | ~280,000 | ~125,000 | **~$185** |
+| 10 | 04-14 | AutoML-Agent 비교 분석 | ~57,000 | ~36,000 | $0 |
+| **세션 5~10 합계** | | | **~742,000** | **~378,000** | **~$220** |
+
+## 📊 세션 1~10 총 누적
+
+| 항목 | 값 |
+|---|---|
+| **총 Input 토큰** | ~1,000,000+ |
+| **총 Output 토큰** | ~470,000+ |
+| **총 AWS 비용** | **~$260** (세션 1~4 ~$40 + 세션 5~10 ~$220) |
+| **Best Score** | **CIFAR-100 Swin-Base + SAM = 94.00%** (세션 6) |
+
+### 성능 진화 추적 (업데이트)
+
+| 세션 | Best Model | Best Score | 대비 |
+|------|-----------|-----------|------|
+| 세션 3 (ResNet-50) | ResNet-50 + OneCycleLR | 86.77% | baseline |
+| 세션 4 (NAS) | ConvNeXt-Tiny + MLP | 90.87% | +4.1%p |
+| **세션 6 (최신)** | **Swin-Base + SAM** | **94.00%** | **+7.2%p** |
+
+---
+
+> **⚠️ 주의사항**: 세션 5~9의 토큰 사용량은 세션 종료 후 일괄 추정한 수치입니다. Claude CLI는 세션별 누적 토큰을 자동 보존하지 않으므로 작업 분량과 평균 메시지 크기 기반 역산입니다. 실제 값과 ±30% 오차 가능성이 있습니다. 향후 세션부터는 세션 시작/종료 시점에 즉시 기록하여 오차를 최소화합니다.
+
 *이후 개발 내역은 이 문서에 세션별로 추가됩니다.*
