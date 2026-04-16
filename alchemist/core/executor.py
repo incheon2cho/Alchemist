@@ -22,6 +22,19 @@ from alchemist.core.schemas import TrialConfig, TrialResult, UserTask
 logger = logging.getLogger(__name__)
 
 
+def _flatten_config(config: "TrialConfig") -> dict:
+    """Convert TrialConfig to a flat dict, merging `extra` into top level.
+
+    train_worker.py reads all keys with flat ``config.get(key)`` calls, so
+    the nested ``extra`` dict must be hoisted to the top level before the job
+    JSON is sent to the remote worker.
+    """
+    flat = asdict(config)
+    extra = flat.pop("extra", {}) or {}
+    flat.update(extra)
+    return flat
+
+
 class TrainingExecutor(ABC):
     """Abstract training executor interface."""
 
@@ -179,7 +192,7 @@ class AWSExecutor(TrainingExecutor):
                 "num_classes": task.num_classes,
                 "eval_metric": task.eval_metric,
             },
-            "config": asdict(config),
+            "config": _flatten_config(config),
         }
         return self._submit_and_wait(job)
 
@@ -218,14 +231,29 @@ class AWSExecutor(TrainingExecutor):
         finally:
             Path(local_tmp).unlink(missing_ok=True)
 
-        # Launch training on remote (background)
-        worker_cmd = (
-            f"cd {self.remote_work_dir} && "
-            f"nohup {self.remote_python} train_worker.py "
-            f"--job {job_file} --output {result_file} "
-            f"> {self.remote_work_dir}/jobs/{job_id}.log 2>&1 &"
+        # Launch training on remote (fire-and-forget via Popen).
+        # No pipes held → no hang. Poll loop below detects completion.
+        submit_cmd = [
+            "ssh",
+            "-i", str(Path(self.key_path).expanduser()),
+            "-o", "StrictHostKeyChecking=no",
+            "-o", f"ConnectTimeout={self.ssh_timeout}",
+            self.host,
+            (
+                f"cd {self.remote_work_dir} && "
+                f"nohup {self.remote_python} train_worker.py "
+                f"--job {job_file} --output {result_file} "
+                f"> {self.remote_work_dir}/jobs/{job_id}.log 2>&1 "
+                f"< /dev/null &"
+            ),
+        ]
+        subprocess.Popen(
+            submit_cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        self._ssh_cmd(worker_cmd)
+        time.sleep(3)  # brief pause for SSH to deliver command
         logger.info("Submitted job %s to %s", job_id, self.host)
 
         # Poll for result

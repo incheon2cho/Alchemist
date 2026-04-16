@@ -21,47 +21,55 @@ colors with a restrained palette (indigo, teal, amber, slate), sans-serif
 labels (similar to Inter or Helvetica). Title at top: "Alchemist: Multi-Agent
 Vision Model Selection and Self-Refinement".
 
-Layout from left to right in four stacked lanes:
+Layout: Controller Agent at CENTER, commanding Benchmark (left) and
+Research (right). User task enters from top-left, final output exits
+bottom-right.
 
-(1) INPUT (leftmost column, amber accent):
-   - Icon of a clipboard labeled "User Task"
-   - Three small bullet chips underneath: "dataset path", "num classes",
-     "metric + budget"
+(1) USER TASK (top-left, amber accent):
+   - Small clipboard icon labeled "User Task"
+   - Chips: "dataset", "classes", "metric", "budget"
+   - Arrow down-right into the Controller
 
-(2) BENCHMARK AGENT (second column, indigo accent):
-   - A rounded rectangle labeled "Benchmark Agent"
-   - Three incoming arrows from three database cylinders on the top:
-       "HuggingFace Hub (timm ImageNet top-1)",
-       "Papers-with-Code (task leaderboard)",
-       "arXiv (recent SoTA)"
-   - Inside the box: three small stacked steps: "Scout", "Score (HF-first,
-     PwC-second)", "Filter external corpora"
-   - Output arrow to the right labeled "Top-K compliant candidates"
+(2) CONTROLLER AGENT (center, large slate rounded rectangle):
+   - Title: "Controller Agent" (largest box, central authority)
+   - Inside, four stacked actions top-to-bottom:
+       "1. Direct Benchmark Agent",
+       "2. Validate & pick Winner (top-K baseline eval)",
+       "3. Direct Research Agent",
+       "4. Judge final result (ship / iterate)"
+   - Left bidirectional arrow to Benchmark Agent
+   - Right bidirectional arrow to Research Agent
+   - Small dashed arrow down to AWS EC2 GPU icon labeled
+     "SSH + train_worker (baseline eval & trials)"
+   - A small "LLM (Claude)" cloud icon attached with dotted line
 
-(3) CONTROLLER + HARNESS (middle column, slate accent):
-   - Rounded rectangle labeled "Controller Agent"
-   - Inside: "Validate recommendation", "Resolve timm ID", "Baseline eval
-     top-K", "Pick Winner"
-   - Small icon of AWS EC2 GPU on the right with a dashed bidirectional
-     arrow labeled "SSH + train_worker"
-   - Output arrow to the right labeled "Winner base model"
+(3) BENCHMARK AGENT (left column, indigo accent):
+   - Rounded rectangle labeled "Benchmark Agent"
+   - Three incoming arrows from three small database cylinders ABOVE it:
+       "HuggingFace Hub (timm top-1)",
+       "Papers-with-Code (task SoTA)",
+       "arXiv (recent papers)"
+   - Inside: "Scout → Score → Rank → Recommend top-K"
+   - Bidirectional arrow to Controller labeled "directive / leaderboard"
 
-(4) RESEARCH AGENT LOOP (rightmost column, teal accent):
+(4) RESEARCH AGENT (right column, teal accent):
    - Large rounded rectangle labeled "Research Agent"
-   - Inside, a circular self-refinement loop with three nodes:
+   - Inside, a circular self-refinement loop with three nodes connected
+     by curved arrows:
+       R0 "Baseline eval",
        R1 "Grid search (lr × freeze × adapter)",
-       R2 "LLM-guided refinement",
-       R3 "SoTA-gap analysis"
-   - A small "Claude CLI" LLM bubble attached with a dotted line
-   - Final output box on the far right labeled "Trained checkpoint + report"
-     with a small trophy or medal icon
+       R2 "LLM-guided refinement + SoTA-gap analysis"
+   - Loop arrow from R2 back to R1 labeled "continue if gap remains"
+   - Bidirectional arrow to Controller labeled "directive / result"
+   - Final output arrow exiting bottom-right to a box:
+     "Trained checkpoint + report" with a small trophy icon
 
-Global details:
-- Thin arrows between the four lanes
-- Tiny footer text at the bottom center: "ImageNet-1K / ImageNet-21K
-  pretraining allowed · external corpora filtered (JFT, LAION, LVD-142M)"
-- Everything aligned horizontally, no 3D effects, no drop shadows
-- High resolution, crisp text labels, legible at paper-column width
+Global:
+- Controller is visually the LARGEST and CENTRAL element
+- Benchmark and Research are SUBORDINATE, flanking left and right
+- All arrows show Controller initiating (solid) and receiving (dashed)
+- Tiny footer: "ImageNet-1K / 21K allowed · JFT, LAION, LVD-142M blocked"
+- No 3D, no drop shadows, crisp labels, IEEE-paper-friendly
 ```
 
 ---
