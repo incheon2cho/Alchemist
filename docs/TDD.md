@@ -12,11 +12,18 @@ alchemist/
 │   ├── schemas.py        — UserTask, Leaderboard, ResearchResult, ExperimentState
 │   ├── llm.py            — LLMClient ABC, MockLLMClient, ClaudeCLIClient, CodexCLIClient
 │   ├── executor.py       — TrainingExecutor (LocalExecutor, AWSExecutor)
-│   └── utils.py          — safe_asdict (enum 직렬화)
+│   ├── utils.py          — safe_asdict (enum 직렬화)
+│   └── retrievers/       — v3 NEW: 외부 지식 검색 모듈 (공용)
+│       ├── __init__.py   — exports
+│       ├── arxiv.py      — ArxivRetriever (Research Agent 사용)
+│       └── hf_hub.py     — HFHubRetriever (Benchmark 주, Research 보조)
+│                           - search_imagenet1k_models (모델 라이브 검색)
+│                           - search_pwc_leaderboard (SoTA 표준)
+│                           - classify_pretrain_source (정책 필터)
 ├── agents/
 │   ├── protocol.py       — AgentMessage, MessageBus, make_directive/response
-│   ├── benchmark.py      — BenchmarkAgent (모델 탐색 + 순위화)
-│   ├── research.py       — ResearchAgent (SoTA 탐색 + NAS + HP 탐색 + 자율 개선)
+│   ├── benchmark.py      — BenchmarkAgent (모델 탐색 + 순위화 + SoTA standing)
+│   ├── research.py       — ResearchAgent (기법 탐색 + NAS + HP 탐색 + 자율 개선)
 │   └── controller.py     — ControllerAgent (통제 + Safety + Ship 판정)
 ├── harness.py            — ThreeAgentHarness (통합 오케스트레이터)
 ├── main.py               — CLI 엔트리포인트
@@ -42,10 +49,13 @@ alchemist/
 | core/schemas.py | test_agents.py, test_edge_cases.py | Unit |
 | core/llm.py | test_edge_cases.py::TestLLMEdgeCases | Unit |
 | core/executor.py | (LocalExecutor는 기존 테스트에서 검증) | Unit |
+| **core/retrievers/arxiv.py** (v3) | test_retrievers.py::TestArxiv | Unit |
+| **core/retrievers/hf_hub.py** (v3) | test_retrievers.py::TestHFHub, ::TestPwCArchive | Unit |
 | agents/protocol.py | test_protocol.py | Unit |
 | agents/benchmark.py | test_agents.py::TestBenchmarkAgent | Unit |
+| **agents/benchmark.py (SoTA standing)** (v3) | test_agents.py::TestBenchmarkAgent::test_search_sota_standing | Unit |
 | agents/research.py | test_agents.py::TestResearchAgent | Unit |
-| agents/research.py (SoTA) | test_agents.py::TestResearchAgent (SoTA 메서드) | Unit |
+| agents/research.py (SoTA techniques) | test_agents.py::TestResearchAgent (SoTA 메서드) | Unit |
 | agents/controller.py | test_agents.py::TestControllerAgent | Unit |
 | harness.py | test_harness.py | Integration + E2E |
 | (edge cases) | test_edge_cases.py | Unit + Integration |
@@ -71,7 +81,13 @@ alchemist/
 | Test Case | 입력 | 기대 결과 |
 |-----------|------|----------|
 | `test_handle_directive_returns_leaderboard` | directive | leaderboard payload 포함 |
+| `test_handle_directive_returns_sota_standing` (v3) | directive + task | response payload에 `sota_standing` 키 존재 |
 | `test_scout_models_returns_known` | "vision encoder" | dinov2, vit_s16 등 포함 |
+| `test_scout_models_includes_hf_hub` (v3) | retriever 활성화 | KNOWN_MODELS 외 HF Hub 모델 추가 |
+| `test_scout_models_filters_imagenet1k` (v3) | retriever 활성화 | pretrain_source!='imagenet-1k' 제외 |
+| `test_search_sota_standing_cifar100` (v3) | UserTask(name='CIFAR-100') | top_score_pct in [80,100], top_model 존재 |
+| `test_search_sota_standing_unknown_dataset` (v3) | UserTask(name='nonexistent') | LLM fallback로 summary 반환 |
+| `test_search_sota_standing_extra_data_flag` (v3) | CIFAR-100 | extra-data 모델 'uses_additional_data'=True |
 | `test_build_leaderboard_ranks_correctly` | 3 models, 2 benchmarks | 점수 높은 모델이 상위 rank |
 | `test_recommend_respects_constraints` | max_params_m=30 | 86M 모델 제외, 22M 추천 |
 | `test_recommend_no_constraint_picks_best` | 제약 없음 | overall_rank 1위 추천 |
@@ -84,7 +100,10 @@ alchemist/
 | `test_baseline_score_exists` | "dinov2_vitb14" | 60 ≤ score ≤ 85 |
 | `test_design_experiment_returns_configs` | max_trials=6 | len ≤ 6, 각 config에 lr 존재 |
 | `test_trials_respect_budget` | budget=0.01 hr | trials < 100 |
-| `test_search_sota_returns_knowledge` | task=cifar100 | SoTA 정보 포함 텍스트 반환 |
+| `test_search_sota_returns_knowledge` | task=cifar100 | SoTA 기법 요약 텍스트 반환 |
+| `test_search_sota_uses_arxiv_evidence` (v3) | retriever 활성화 | LLM 프롬프트에 arXiv 논문 evidence 포함 |
+| `test_search_sota_accepts_benchmark_standing` (v3) | sota_standing 인자 | summary 텍스트 안에 sota_standing 반영 |
+| `test_search_sota_arxiv_failure_graceful` (v3) | arxiv mock raises | 에러 없이 진행, 텍스트에 "arxiv unavailable" |
 | `test_analyze_sota_gap_identifies_missing` | score=93%, sota=96% | gap + 기법 제안 포함 |
 | `test_suggest_techniques_returns_configs` | sota + history | config 리스트 (len > 0) |
 | `test_design_with_sota_knowledge` | sota_knowledge 전달 | LLM 프롬프트에 SoTA 반영 |
@@ -101,6 +120,40 @@ alchemist/
 | `test_judge_result_no_improvement` | best=68, baseline=70 | ok=False |
 | `test_safety_budget_exhausted` | used=100/100 | budget_exhausted=True |
 | `test_safety_budget_ok` | used=10/100 | len(issues)=0 |
+
+### test_retrievers.py — External Knowledge Retrievers (v3 NEW)
+
+**ArxivRetriever:**
+
+| Test Case | 입력 | 기대 결과 |
+|-----------|------|----------|
+| `test_search_returns_papers` | query='SAM optimizer', years=[2023,2024] | len(out) ≤ top_k, year ∈ years |
+| `test_search_year_filter` | years=[2024] | 모든 paper.year == 2024 |
+| `test_search_caches_results` | 동일 query 2회 | 두 번째 호출은 cache 파일에서 즉시 반환 |
+| `test_search_network_failure_returns_empty` | mock connection error | [] 반환, 예외 안 발생 |
+| `test_get_paper_by_id` | arxiv_id='2305.12345' | 단일 dict (title/summary 포함) |
+| `test_summarize_for_llm_truncates` | 30 papers, max_chars=1000 | len(text) ≤ 1000 |
+
+**HFHubRetriever — Models:**
+
+| Test Case | 입력 | 기대 결과 |
+|-----------|------|----------|
+| `test_search_models_pipeline_filter` | pipeline_tag='image-classification' | 모든 결과 pipeline_tag 일치 |
+| `test_search_models_library_filter` | library='timm' | 모든 결과 'timm' 태그 |
+| `test_search_imagenet1k_models_filters_pretrain` | limit=10 | 모든 결과 pretrain_source=='imagenet-1k' |
+| `test_classify_pretrain_source_in1k` | tag 'in1k' | 'imagenet-1k' |
+| `test_classify_pretrain_source_jft` | tag 'jft' | 'large-extra' |
+| `test_get_model_meta_returns_card` | model_id='timm/resnet50.a1_in1k' | dict with 'card' (str) |
+
+**HFHubRetriever — PwC Archive:**
+
+| Test Case | 입력 | 기대 결과 |
+|-----------|------|----------|
+| `test_load_pwc_eval_loads_dataframe` | first call | DataFrame, len > 1000 |
+| `test_search_pwc_leaderboard_cifar100` | dataset='CIFAR-100' | hits ≥ 1, model names 비어있지 않음 |
+| `test_search_pwc_leaderboard_top_score_extracted` | dataset='CIFAR-100' | top_score 80–100% (numeric value) |
+| `test_search_pwc_leaderboard_extra_data_flag` | dataset='CIFAR-100' | uses_additional_data flag 반영 |
+| `test_search_pwc_leaderboard_unknown_dataset_empty` | dataset='nonexistent' | [] 반환 |
 
 ---
 
@@ -167,6 +220,9 @@ alchemist/
 | 2 | 빈 metrics에서 규칙 엔진이 0과 target 비교 | test_decide_with_empty_metrics | `"key" in metrics` 존재 확인 |
 | 3 | Research Agent OOM 시 crash | test_zero_budget_stops_early | OOM catch + graceful skip |
 | 4 | DINOv2 img_size 518 강제 | 실측 벤치마크 | `img_size=224` 문서화 |
+| 5 (v3) | PwC parquet 의 numpy 배열 vs `or []` 충돌 | `test_search_pwc_leaderboard_*` | `len(arr) == 0` 명시 검사 |
+| 6 (v3) | `huggingface_hub.list_models()` `library`/`direction` kwarg 제거됨 | `test_search_models_library_filter` | `filter=[library, *tags]` 형태로 호출 |
+| 7 (v3) | arxiv 라이브러리 미설치 시 임포트 에러 | `test_search_network_failure_returns_empty` | try/except → 빈 리스트 반환 |
 
 ---
 

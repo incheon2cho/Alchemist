@@ -126,6 +126,8 @@ class ResearchAgent:
         executor: TrainingExecutor | None = None,
         max_rounds: int = 3,
         log_dir: Path | None = None,
+        arxiv_retriever=None,
+        enable_retrieval: bool = True,
     ):
         self.llm = llm or MockLLMClient()
         self.name = AgentRole.RESEARCH
@@ -133,6 +135,15 @@ class ResearchAgent:
         self.max_rounds = max_rounds
         self.executor = executor or LocalExecutor()
         self.research_log = ResearchLog(log_dir=log_dir)
+        self.enable_retrieval = enable_retrieval
+        self.arxiv = arxiv_retriever
+        if enable_retrieval and self.arxiv is None:
+            try:
+                from alchemist.core.retrievers import ArxivRetriever
+                self.arxiv = ArxivRetriever()
+            except Exception as e:
+                logger.warning("ArxivRetriever unavailable (%s)", e)
+                self.enable_retrieval = False
 
     def handle_directive(
         self,
@@ -406,13 +417,35 @@ class ResearchAgent:
         freeze_options = [True] if is_large_model else DEFAULT_FREEZE_OPTIONS
 
         if round_num == 1:
-            # Round 1: broad exploration
+            # Round 1: broad exploration.
+            # batch_size scales by model size to keep GPU saturated without OOM
+            # on an A10G 24 GB. Small/mid models (< 50M) get 128; large
+            # 50–100M get 64 (safer margin for activations+optimizer states).
+            def _default_batch(params_m: float, freeze: bool) -> int:
+                if freeze:
+                    return 256  # linear probe / no grad on backbone
+                if params_m >= 50:
+                    return 64
+                return 128
+            params_m = 0.0
+            for name, info in [
+                ("dinov2_vitb14", {"params_m": 86}),
+                ("vit_b16_dino", {"params_m": 86}),
+                ("convnextv2_base", {"params_m": 89}),
+                ("convnext_base", {"params_m": 88}),
+                ("convnext_small", {"params_m": 50}),
+                ("maxvit_tiny", {"params_m": 29}),
+                ("efficientnet", {"params_m": 20}),
+            ]:
+                if name in base_model:
+                    params_m = info["params_m"]
+                    break
             for lr in DEFAULT_LR_CANDIDATES:
                 for freeze in freeze_options:
                     for adapter in ["linear_head", "none"]:
                         configs.append(TrialConfig(
                             lr=lr,
-                            batch_size=16 if not freeze else 32,
+                            batch_size=_default_batch(params_m, freeze),
                             epochs=10,
                             weight_decay=0.01,
                             scheduler="cosine",
@@ -475,41 +508,89 @@ class ResearchAgent:
     # External Knowledge: SoTA Search + Gap Analysis + Technique Suggestion
     # ------------------------------------------------------------------
 
-    def search_sota(self, task: UserTask) -> str:
-        """Search for SoTA results and latest techniques for the given task via LLM.
+    def search_sota(
+        self,
+        task: UserTask,
+        sota_standing: dict | None = None,
+    ) -> str:
+        """Synthesise an SoTA techniques summary for the given task.
 
-        Returns a summary of SoTA knowledge that informs experiment design.
+        This now focuses on **HOW to improve** (techniques, optimizers,
+        augmentation) rather than "what's the best number" — the latter is
+        provided by Benchmark Agent via ``sota_standing`` and passed in here.
+
+        Evidence sources:
+          1. ``sota_standing`` (optional) — top entries from Benchmark Agent's
+             PwC leaderboard lookup, telling the LLM which models already
+             achieve top scores (so it can extract their shared techniques).
+          2. arXiv retrieval — recent papers (≤ 3 years) about the specific
+             benchmark or about promising technique keywords.
+          3. The LLM's internal knowledge — used to synthesise and extrapolate.
         """
+        # 1. arXiv evidence: dataset-name + generic technique vocabulary.
+        arxiv_text = "(retrieval disabled)"
+        if self.enable_retrieval and self.arxiv is not None:
+            try:
+                # Query 1: benchmark-specific
+                papers_a = self.arxiv.search(
+                    query=f"{task.name} image classification",
+                    years=[2023, 2024, 2025],
+                    top_k=5,
+                    sort_by="relevance",
+                )
+                # Query 2: general training-recipe techniques
+                papers_b = self.arxiv.search(
+                    query="sharpness-aware minimization image classification",
+                    years=[2022, 2023, 2024, 2025],
+                    top_k=3,
+                    sort_by="relevance",
+                )
+                combined = papers_a + [p for p in papers_b
+                                        if p["arxiv_id"] not in {q["arxiv_id"] for q in papers_a}]
+                arxiv_text = self.arxiv.summarize_for_llm(combined[:8], max_chars=2500)
+            except Exception as e:
+                logger.warning("arxiv retrieval failed: %s", e)
+                arxiv_text = f"(arxiv unavailable: {type(e).__name__})"
+
+        # 2. SoTA standing evidence (from Benchmark Agent, optional)
+        standing_text = "(not provided by Benchmark Agent)"
+        if sota_standing and sota_standing.get("summary"):
+            standing_text = sota_standing["summary"]
+
         prompt = (
-            f"You are a computer vision research assistant. "
-            f"For the following task, provide:\n\n"
-            f"Task: {task.description} (dataset: {task.name}, {task.num_classes} classes, "
-            f"metric: {task.eval_metric})\n\n"
-            f"1. What are the current state-of-the-art (SoTA) results on this benchmark?\n"
-            f"   - Include model names, accuracy scores, and year\n"
-            f"   - Separate 'with pretraining' and 'without pretraining' results\n\n"
-            f"2. What techniques are most effective for this benchmark?\n"
-            f"   - Optimizers (SGD, AdamW, SAM, LAMB, etc.)\n"
-            f"   - LR schedules (cosine, OneCycleLR, warm restarts, etc.)\n"
-            f"   - Augmentation (Mixup, CutMix, RandAugment, AugMax, etc.)\n"
-            f"   - Regularization (label smoothing, dropout, stochastic depth, etc.)\n"
-            f"   - Architecture tricks (SE, CBAM, attention, etc.)\n"
-            f"   - Pretrained weights (ImageNet-1K vs 21K vs JFT, etc.)\n\n"
-            f"3. What are the key gaps between mid-range (90%) and top (96%) performance?\n\n"
-            f"Be concise and specific with numbers."
+            f"You are a computer vision research assistant. Use the evidence "
+            f"below to analyse effective techniques for the task.\n\n"
+            f"## Task\n"
+            f"- Dataset: {task.name} ({task.num_classes} classes)\n"
+            f"- Description: {task.description}\n"
+            f"- Metric: {task.eval_metric}\n\n"
+            f"## Current SoTA standing (from Benchmark Agent)\n"
+            f"{standing_text}\n\n"
+            f"## Recent arXiv papers (2023–2025)\n"
+            f"{arxiv_text}\n\n"
+            f"## Instructions\n"
+            f"Using the evidence above plus your own knowledge, summarise:\n"
+            f"1. What TECHNIQUES drive the top performance on this benchmark? "
+            f"Focus on: optimizer (SGD/AdamW/SAM/LAMB), LR schedule, "
+            f"augmentation (Mixup/CutMix/RandAugment), regularization "
+            f"(label smoothing, stochastic depth, EMA), architecture tweaks.\n"
+            f"2. Which of these techniques are still under-explored / promising "
+            f"to combine for improvement above the current SoTA?\n"
+            f"3. What external-data shortcuts (JFT, LAION, ImageNet-21K) should "
+            f"be FLAGGED as non-allowed for fair comparison?\n\n"
+            f"Be concise. Prefer specific paper references from the arXiv list."
         )
         try:
             result = self.llm.generate(prompt)
-            logger.info("SoTA search completed for task '%s'", task.name)
+            logger.info("SoTA techniques synthesis completed for '%s'", task.name)
             return result
         except Exception as e:
-            logger.warning("SoTA search failed: %s", e)
+            logger.warning("SoTA techniques synthesis failed: %s", e)
             return (
-                f"SoTA for {task.name}: "
-                f"Best with pretraining ~96% (EffNet-L2+SAM, JFT-300M). "
-                f"Best without pretraining ~86% (PyramidNet+CutMix). "
-                f"Key techniques: SAM optimizer, larger pretrained models, "
-                f"longer training, Mixup+CutMix, label smoothing, stochastic depth."
+                f"SoTA techniques for {task.name} (LLM knowledge only): "
+                f"SAM optimizer, OneCycleLR / cosine warm restarts, "
+                f"Mixup + CutMix + RandAugment, label smoothing 0.1, "
+                f"stochastic depth 0.1–0.3, EMA, longer training (100–300 epochs)."
             )
 
     def analyze_sota_gap(

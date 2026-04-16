@@ -41,7 +41,10 @@ class LeaderboardEntry:
     scores: dict[str, float] = field(default_factory=dict)   # benchmark → score
     ranks: dict[str, int] = field(default_factory=dict)      # benchmark → rank
     overall_rank: int = 0                 # median rank across benchmarks
-    source: str = "measured"              # "measured" | "published"
+    source: str = "measured"              # "measured" | "published" | "pwc"
+    uses_additional_data: bool = False    # True = pretrained on corpora beyond ImageNet-1K
+    paper_title: str = ""
+    paper_date: str | None = None
 
 
 @dataclass
@@ -49,8 +52,9 @@ class Leaderboard:
     entries: list[LeaderboardEntry] = field(default_factory=list)
     benchmarks: list[str] = field(default_factory=list)
     updated_at: str = ""
-    recommendation: str = ""              # 추천 모델 이름
+    recommendation: str = ""              # 추천 모델 이름 (top-1)
     recommendation_reason: str = ""
+    candidates: list[str] = field(default_factory=list)  # top-K compliant timm-resolvable IDs
 
 
 # ---------------------------------------------------------------------------

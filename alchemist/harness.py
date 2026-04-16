@@ -124,6 +124,57 @@ class ThreeAgentHarness:
         valid, reason = self.controller.validate_recommendation(leaderboard, task)
         logger.info("Recommendation validation: %s — %s", valid, reason)
 
+        import timm as _timm
+        known_models = set(_timm.list_models())
+
+        def _resolve_timm_id(name: str) -> str | None:
+            cand = name.replace("timm/", "", 1)
+            if cand in known_models:
+                return cand
+            if cand.split(".")[0] in known_models:
+                return cand.split(".")[0]
+            return None
+
+        # Build list of top-K timm-resolvable + compliant candidates
+        candidate_names: list[str] = list(leaderboard.candidates) or ([leaderboard.recommendation] if leaderboard.recommendation else [])
+        resolved_candidates: list[str] = []
+        for name in candidate_names:
+            tid = _resolve_timm_id(name)
+            if tid and tid not in resolved_candidates:
+                resolved_candidates.append(tid)
+        # If validator rejected or no candidates resolved, widen the search
+        if (not valid) or not resolved_candidates:
+            for entry in leaderboard.entries:
+                if entry.uses_additional_data:
+                    continue
+                tid = _resolve_timm_id(entry.model_name)
+                if tid and tid not in resolved_candidates:
+                    resolved_candidates.append(tid)
+                if len(resolved_candidates) >= 3:
+                    break
+        if not resolved_candidates:
+            resolved_candidates = ["convnext_base.fb_in1k"]
+
+        # Top-K baseline evaluation: pick the best-performing model for Research Agent
+        if len(resolved_candidates) > 1:
+            logger.info(
+                "Evaluating %d candidates via quick baseline: %s",
+                len(resolved_candidates), resolved_candidates,
+            )
+            best_score, best_model = -1.0, resolved_candidates[0]
+            for cand in resolved_candidates:
+                try:
+                    score = self.research.executor.evaluate_baseline(cand, task)
+                    logger.info("  Candidate %s baseline: %.2f%%", cand, score)
+                    if score > best_score:
+                        best_score, best_model = score, cand
+                except Exception as e:
+                    logger.warning("  Candidate %s baseline failed: %s", cand, e)
+            logger.info("Winner: %s (%.2f%%)", best_model, best_score)
+            base_model = best_model
+        else:
+            base_model = resolved_candidates[0]
+
         # Phase 2: Research (Research Agent handles its own iteration loop)
         self.state.phase = "researching"
         result = self.run_research(base_model, task, trace_id)
@@ -269,6 +320,9 @@ class ThreeAgentHarness:
                 ranks=e.get("ranks", {}),
                 overall_rank=e.get("overall_rank", 0),
                 source=e.get("source", ""),
+                uses_additional_data=bool(e.get("uses_additional_data", False)),
+                paper_title=e.get("paper_title", "") or "",
+                paper_date=e.get("paper_date"),
             ))
         return Leaderboard(
             entries=entries,
@@ -276,6 +330,7 @@ class ThreeAgentHarness:
             updated_at=lb_data.get("updated_at", ""),
             recommendation=lb_data.get("recommendation", ""),
             recommendation_reason=lb_data.get("recommendation_reason", ""),
+            candidates=list(lb_data.get("candidates", [])),
         )
 
     def _extract_research_result(self, msg: AgentMessage) -> ResearchResult:

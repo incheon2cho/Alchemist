@@ -64,9 +64,30 @@ PUBLISHED_SCORES: dict[str, dict[str, float]] = {
 class BenchmarkAgent:
     """Agent ① — Model Scouting + Benchmarking + Ranking."""
 
-    def __init__(self, llm: LLMClient | None = None):
+    def __init__(
+        self,
+        llm: LLMClient | None = None,
+        hf_retriever=None,
+        enable_retrieval: bool = True,
+    ):
         self.llm = llm or MockLLMClient()
         self.name = AgentRole.BENCHMARK
+        self.enable_retrieval = enable_retrieval
+        self.hf = hf_retriever
+        self.arxiv = None
+        if enable_retrieval and self.hf is None:
+            try:
+                from alchemist.core.retrievers import HFHubRetriever
+                self.hf = HFHubRetriever()
+            except Exception as e:
+                logger.warning("HFHubRetriever unavailable (%s); retrieval disabled", e)
+                self.enable_retrieval = False
+        if enable_retrieval:
+            try:
+                from alchemist.core.retrievers import ArxivRetriever
+                self.arxiv = ArxivRetriever()
+            except Exception as e:
+                logger.warning("ArxivRetriever unavailable (%s); arXiv evidence disabled", e)
 
     def handle_directive(
         self,
@@ -77,16 +98,21 @@ class BenchmarkAgent:
         payload = msg.payload
         benchmarks = payload.get("benchmarks", ["linear_probe", "knn"])
 
-        # 1. Scout models
-        models = self.scout_models(payload.get("search_query", "vision encoder"))
+        # 1. Scout models (task-aware: seeds with PwC + HF Hub)
+        models = self.scout_models(payload.get("search_query", "vision encoder"), task=task)
 
-        # 2. Run benchmarks (or use published scores)
-        scored_models = self.run_benchmarks(models, benchmarks)
+        # 2. Run benchmarks (PwC actual scores when available, else estimated)
+        scored_models = self.run_benchmarks(models, benchmarks, task=task)
 
         # 3. Build leaderboard with rankings
         leaderboard = self.build_leaderboard(scored_models, benchmarks)
 
-        # 4. Recommend best model for user task
+        # 4. Look up SoTA standing (the number the Research Agent must beat)
+        sota_standing = None
+        if task:
+            sota_standing = self.search_sota_standing(task, top_k=5)
+
+        # 5. Recommend best model for user task
         if task:
             leaderboard = self.recommend(leaderboard, task)
 
@@ -96,52 +122,362 @@ class BenchmarkAgent:
                 "leaderboard": safe_asdict(leaderboard),
                 "model_count": len(leaderboard.entries),
                 "benchmarks": benchmarks,
+                "sota_standing": sota_standing,
             },
             episode=msg.episode,
             budget=msg.budget_remaining,
             trace_id=msg.trace_id,
         )
 
-    def scout_models(self, query: str = "") -> list[dict[str, Any]]:
-        """Scout latest models from papers/hubs. (LLM + Web in production)"""
-        # In production: arXiv search, HuggingFace API, PapersWithCode
-        # For now: return known models + LLM suggestion for new ones
-        models = list(KNOWN_MODELS)
+    def search_sota_standing(
+        self,
+        task: UserTask,
+        top_k: int = 5,
+    ) -> dict[str, Any]:
+        """Look up the current SoTA standing for the user's benchmark.
 
+        Returns::
+            {
+              "task": task.name,
+              "entries": [
+                {"model": ..., "metrics": {...}, "paper_title": ...,
+                 "paper_date": ..., "uses_additional_data": bool}, ...
+              ],
+              "top_score_pct": float or None,    # best numeric metric found
+              "top_model": str or None,
+              "top_paper": str or None,
+              "summary": "<LLM-friendly multi-line text>",
+            }
+
+        Data source: ``pwc-archive`` parquet dumps on HuggingFace (final snapshot
+        before PapersWithCode shutdown in July 2025). Falls back to a free-form
+        LLM answer if the dump is unavailable.
+        """
+        result: dict[str, Any] = {
+            "task": task.name,
+            "entries": [],
+            "top_score_pct": None,
+            "top_model": None,
+            "top_paper": None,
+            "summary": "",
+        }
+
+        # 1. PwC archive leaderboard lookup
+        entries: list[dict[str, Any]] = []
+        if self.enable_retrieval and self.hf is not None:
+            try:
+                entries = self.hf.search_pwc_leaderboard(
+                    task.name,
+                    metric_keywords=["accuracy", "top-1", "top 1", "f1", "map", "ap"],
+                    top_k=top_k,
+                )
+            except Exception as e:
+                logger.warning("PwC SoTA lookup failed: %s", e)
+
+        # 2. Try to extract a numeric top score
+        import re
+        best_score = -1.0
+        for e in entries:
+            for v in (e.get("metrics") or {}).values():
+                s = str(v)
+                m = re.search(r"(\d+(?:\.\d+)?)", s)
+                if m:
+                    try:
+                        val = float(m.group(1))
+                        # heuristic: percentages in [0, 100]
+                        if 0 < val <= 100 and val > best_score:
+                            best_score = val
+                            result["top_score_pct"] = val
+                            result["top_model"] = e.get("model")
+                            result["top_paper"] = e.get("paper_title") or e.get("paper_url")
+                    except ValueError:
+                        pass
+
+        result["entries"] = entries
+
+        # 3. Always produce an LLM-friendly summary (even when empty)
+        if entries:
+            lines = [f"Current SoTA standing on {task.name} (from PwC archive snapshot):"]
+            for i, e in enumerate(entries, 1):
+                metric_s = ", ".join(
+                    f"{k}={v}" for k, v in list((e.get('metrics') or {}).items())[:2]
+                )
+                extra = " [uses additional data]" if e.get("uses_additional_data") else ""
+                lines.append(
+                    f"  [{i}] {e.get('model', '?')} — {metric_s}{extra} "
+                    f"({e.get('paper_date', '?')})"
+                )
+            result["summary"] = "\n".join(lines)
+        else:
+            # LLM fallback — ask for estimated SoTA (marks it as LLM-estimated)
+            est = safe_llm_call(
+                self.llm,
+                (
+                    f"What is the reported state-of-the-art Top-1 accuracy on "
+                    f"the {task.name} benchmark (as of your training data)? "
+                    f"Return JSON with keys: top_model, top_score_pct, "
+                    f"top_paper_title, year, note."
+                ),
+                fallback={},
+            )
+            if isinstance(est, dict) and est.get("top_score_pct"):
+                result["top_score_pct"] = est.get("top_score_pct")
+                result["top_model"] = est.get("top_model")
+                result["top_paper"] = est.get("top_paper_title")
+                result["summary"] = (
+                    f"Estimated SoTA (LLM, no external retrieval): "
+                    f"{est.get('top_model')} → {est.get('top_score_pct')}% "
+                    f"({est.get('top_paper_title')}, {est.get('year')}). "
+                    f"Note: {est.get('note', '')}"
+                )
+            else:
+                result["summary"] = (
+                    f"SoTA standing for {task.name} unavailable "
+                    f"(no retrieval source + no LLM estimate)"
+                )
+
+        logger.info(
+            "SoTA standing for %s: top=%.2f%% (%s)",
+            task.name, result["top_score_pct"] or 0.0, result["top_model"],
+        )
+        return result
+
+    def scout_models(self, query: str = "", task: UserTask | None = None) -> list[dict[str, Any]]:
+        """Scout candidate models.
+
+        Sources (in order):
+          1. PwC leaderboard for ``task.name`` — models with actual SoTA scores
+             on this specific task. Tagged with ``pwc_metric`` + compliance flag.
+          2. ``KNOWN_MODELS`` — curated seed set (stable baseline).
+          3. HuggingFace Hub — live discovery of ImageNet-1K pretrained timm
+             models (if retrieval enabled).
+          4. LLM — model suggestions informed by the live list above.
+        """
+        models: list[dict[str, Any]] = []
+        seen: set = set()
+
+        # 1. PwC task-specific leaderboard → models with real metric values
+        pwc_evidence = ""
+        if task and self.enable_retrieval and self.hf is not None:
+            dataset_aliases = self._task_to_pwc_aliases(task.name)
+            pwc_hits: list[dict[str, Any]] = []
+            for alias in dataset_aliases:
+                try:
+                    pwc_hits = self.hf.search_pwc_leaderboard(
+                        alias,
+                        metric_keywords=["accuracy", "top-1", "top 1"],
+                        top_k=15,
+                    )
+                    if pwc_hits:
+                        break
+                except Exception as e:
+                    logger.warning("PwC lookup for %s failed: %s", alias, e)
+            if pwc_hits:
+                for hit in pwc_hits:
+                    model_name = hit.get("model", "").strip()
+                    if not model_name or model_name in seen:
+                        continue
+                    score_pct = self._extract_primary_score(hit.get("metrics", {}))
+                    models.append({
+                        "name": model_name,
+                        "source": "pwc",
+                        "pwc_score_pct": score_pct,
+                        "uses_additional_data": hit.get("uses_additional_data", False),
+                        "paper_title": hit.get("paper_title", ""),
+                        "paper_date": hit.get("paper_date"),
+                    })
+                    seen.add(model_name)
+                logger.info("PwC scout for '%s': +%d SoTA entries", task.name, len(pwc_hits))
+                pwc_evidence = self.hf.summarize_leaderboard_for_llm(pwc_hits, max_chars=1500)
+
+        # 2. Curated seeds (always included as safety net)
+        for m in KNOWN_MODELS:
+            if m["name"] not in seen:
+                models.append({**m, "source": m.get("source", "known")})
+                seen.add(m["name"])
+
+        # 3. HF Hub live discovery (pretrain-source-filtered + timm real top1 scoring)
+        hub_evidence = "(retrieval disabled)"
+        if self.enable_retrieval and self.hf is not None:
+            try:
+                hub_models = self.hf.search_imagenet1k_models(limit=40, library="timm")
+                for m in hub_models:
+                    short = m["id"].replace("timm/", "")
+                    if short in seen:
+                        continue
+                    # Hard filter: skip models pretrained on truly external corpora
+                    # (LAION/JFT/LVD-142M/CLIP). ImageNet-21K is now allowed.
+                    low = short.lower()
+                    if any(bad in low for bad in ("laion", "jft", "lvd142m", "dinov2", "clip", "datacomp")):
+                        continue
+                    top1 = self.hf.timm_imagenet_top1(short)
+                    if top1 is None:
+                        # Skip HF uploads without an official timm imagenet score —
+                        # they're typically personal fine-tunes, not general backbones.
+                        continue
+                    row = self.hf._load_timm_imagenet_results().get(short) or {}
+                    models.append({
+                        "name": short,
+                        "hf_id": m["id"],
+                        "source": "huggingface",
+                        "pretrain_source": m.get("pretrain_source", "imagenet-1k"),
+                        "downloads": m.get("downloads", 0),
+                        "timm_imagenet_top1": top1,
+                        "params_m": row.get("param_count", m.get("params_m", 0)),
+                        "img_size": row.get("img_size", 224),
+                    })
+                    seen.add(short)
+                hub_evidence = self.hf.summarize_models_for_llm(hub_models, max_chars=2000)
+                logger.info(
+                    "HF Hub scout: +%d models (with timm top1 for %d)",
+                    sum(1 for x in models if x.get("source") == "huggingface"),
+                    sum(1 for x in models if x.get("source") == "huggingface" and x.get("timm_imagenet_top1")),
+                )
+            except Exception as e:
+                logger.warning("HF Hub scout failed: %s", e)
+
+        # 4. arXiv — recent SoTA paper architectures on this task
+        arxiv_evidence = ""
+        if task and self.arxiv is not None:
+            try:
+                papers = self.arxiv.search(
+                    f"{task.name} image classification SoTA",
+                    years=[2023, 2024, 2025],
+                    top_k=5,
+                )
+                if papers:
+                    arxiv_evidence = self.arxiv.summarize_for_llm(papers, max_chars=1500)
+                    logger.info("arXiv scout for '%s': +%d recent papers", task.name, len(papers))
+            except Exception as e:
+                logger.warning("arXiv scout failed: %s", e)
+
+        # 5. LLM suggestions grounded in all three evidence streams (PwC + HF + arXiv)
+        ctx_parts = []
+        if pwc_evidence:
+            ctx_parts.append(f"PwC SoTA for task:\n{pwc_evidence}")
+        if hub_evidence:
+            ctx_parts.append(f"HuggingFace Hub candidates:\n{hub_evidence}")
+        if arxiv_evidence:
+            ctx_parts.append(f"Recent arXiv papers on this task:\n{arxiv_evidence}")
+        ctx = "\n\n".join(ctx_parts) or "(no retrieval evidence)"
         llm_result = safe_llm_call(
             self.llm,
-            f"Suggest latest vision encoder models for: {query}. "
-            f"Return JSON with 'new_models' list.",
+            (
+                f"Suggest latest vision encoder models for: {query}.\n"
+                f"Evidence:\n{ctx}\n\n"
+                f"Propose additional models NOT in the list above that may be "
+                f"worth benchmarking. Restrict to ImageNet-1K-pretrained only.\n"
+                f"Return JSON: {{\"new_models\": [{{\"name\": ..., \"backend\": ..., \"params_m\": ...}}]}}"
+            ),
             fallback={"new_models": []},
         )
         if isinstance(llm_result, dict):
             for m in llm_result.get("new_models", []):
-                if isinstance(m, dict) and m.get("name"):
+                if isinstance(m, dict) and m.get("name") and m["name"] not in seen:
+                    m["source"] = m.get("source", "llm_suggestion")
                     models.append(m)
+                    seen.add(m["name"])
 
-        logger.info("Model Scout: found %d candidate models", len(models))
+        logger.info("Model Scout: %d candidates total", len(models))
         return models
+
+    # PwC dataset name aliases per task (task.name → candidate leaderboard names)
+    _PWC_ALIASES = {
+        "cifar100":   ["CIFAR-100", "Image Classification on CIFAR-100"],
+        "cifar10":    ["CIFAR-10", "Image Classification on CIFAR-10"],
+        "imagenet":   ["ImageNet", "ImageNet-1k"],
+        "butterfly":  ["Butterfly Image Classification", "Fine-Grained Image Classification"],
+        "shopee_iet": [],  # not on PwC
+    }
+
+    def _task_to_pwc_aliases(self, task_name: str) -> list[str]:
+        key = (task_name or "").lower().replace("-", "").replace("_", "")
+        for k, aliases in self._PWC_ALIASES.items():
+            if k.replace("_", "") == key:
+                return aliases
+        return [task_name]  # try the raw name as last resort
+
+    @staticmethod
+    def _extract_primary_score(metrics: dict[str, Any]) -> float | None:
+        import re
+        priority = ("Accuracy", "Top 1", "Top-1", "Percentage correct", "mAP", "F1", "AUC")
+        for key in priority:
+            for mk, mv in metrics.items():
+                if key.lower() in mk.lower():
+                    m = re.search(r"(\d+(?:\.\d+)?)", str(mv))
+                    if m:
+                        try:
+                            v = float(m.group(1))
+                            if 0 < v <= 100:
+                                return v
+                        except ValueError:
+                            pass
+        return None
+
+    @staticmethod
+    def _hf_popularity_score(downloads: int) -> float:
+        """Map HF monthly downloads to a 0-100 popularity score (log-scaled).
+
+        1 DL → ~0, 100 → ~33, 10K → ~67, 1M → ~100.
+        """
+        import math
+        if downloads <= 0:
+            return 0.0
+        return min(100.0, math.log10(downloads + 1) * 100.0 / 6.0)
 
     def run_benchmarks(
         self,
         models: list[dict[str, Any]],
         benchmarks: list[str],
+        task: UserTask | None = None,
     ) -> list[dict[str, Any]]:
-        """Run benchmarks on all models. Uses published scores or simulates."""
+        """Score models. Priority (per user directive):
+          1. HuggingFace Hub models: popularity score (from downloads); when a
+             PwC task score also exists for the same model, use PwC accuracy
+             instead (better signal than popularity).
+          2. PwC leaderboard models: real task accuracy from PwC archive.
+          3. PUBLISHED_SCORES seed models (backwards compat).
+          4. Simulated score (last resort).
+
+        Source priority for ranking is handled in build_leaderboard().
+        """
+        # Pre-build name → pwc_score lookup so HF Hub models benefit from PwC
+        # accuracy if they appear under the same name in the PwC leaderboard.
+        pwc_lookup = {m["name"]: m["pwc_score_pct"]
+                      for m in models
+                      if m.get("source") == "pwc" and m.get("pwc_score_pct") is not None}
+
         results = []
         for model in models:
             name = model["name"]
-            scores = {}
+            source = model.get("source", "unknown")
+            scores: dict[str, float] = {}
 
-            # Use published scores if available
-            if name in PUBLISHED_SCORES:
+            if source == "huggingface":
+                # 1. HF Hub model — prefer timm's official ImageNet top-1 (real
+                # performance), else PwC task accuracy, else popularity proxy.
+                top1 = model.get("timm_imagenet_top1")
+                pwc_match = pwc_lookup.get(name)
+                if top1 is not None:
+                    base = float(top1)
+                elif pwc_match is not None:
+                    base = float(pwc_match)
+                else:
+                    base = self._hf_popularity_score(model.get("downloads", 0))
+                for bench in benchmarks:
+                    scores[bench] = base
+            elif source == "pwc":
+                # 2. PwC entry — real task accuracy
+                pwc_score = model.get("pwc_score_pct")
+                for bench in benchmarks:
+                    scores[bench] = pwc_score if pwc_score is not None else self._simulate_score(bench)
+            elif name in PUBLISHED_SCORES:
+                # 3. Seed model with hardcoded score
                 published = PUBLISHED_SCORES[name]
                 for bench in benchmarks:
-                    if bench in published:
-                        scores[bench] = published[bench]
-                    else:
-                        scores[bench] = self._simulate_score(bench)
+                    scores[bench] = published.get(bench, self._simulate_score(bench))
             else:
+                # 4. Unknown — simulated
                 for bench in benchmarks:
                     scores[bench] = self._simulate_score(bench)
 
@@ -157,20 +493,35 @@ class BenchmarkAgent:
         """Build ranked leaderboard from scored models."""
         entries = []
         for model in scored_models:
+            model_src = model.get("source", "")
+            if model_src in ("huggingface", "pwc"):
+                src = model_src
+            elif model["name"] in PUBLISHED_SCORES:
+                src = "published"
+            elif model_src == "known":
+                src = "known"
+            else:
+                src = "estimated"
             entries.append(LeaderboardEntry(
                 model_name=model["name"],
                 backend=model.get("backend", "unknown"),
                 params_m=model.get("params_m", 0),
                 scores=model["scores"],
-                source="published" if model["name"] in PUBLISHED_SCORES else "estimated",
+                source=src,
+                uses_additional_data=bool(model.get("uses_additional_data", False)),
+                paper_title=model.get("paper_title", "") or "",
+                paper_date=model.get("paper_date"),
             ))
 
-        # Compute per-benchmark ranks
+        # User directive: HuggingFace-first, PwC-second priority.
+        # Lower tier number ranks higher.
+        _source_tier = {"huggingface": 1, "pwc": 2, "published": 3, "known": 3, "estimated": 4}
+
+        # Compute per-benchmark ranks respecting source tier
         for bench in benchmarks:
             sorted_by_bench = sorted(
                 entries,
-                key=lambda e: e.scores.get(bench, 0),
-                reverse=True,
+                key=lambda e: (_source_tier.get(e.source, 5), -e.scores.get(bench, 0)),
             )
             for rank, entry in enumerate(sorted_by_bench, 1):
                 entry.ranks[bench] = rank
@@ -182,7 +533,7 @@ class BenchmarkAgent:
             else:
                 entry.overall_rank = len(entries)
 
-        entries.sort(key=lambda e: e.overall_rank)
+        entries.sort(key=lambda e: (_source_tier.get(e.source, 5), e.overall_rank))
 
         from datetime import datetime, timezone
         return Leaderboard(
@@ -207,6 +558,30 @@ class BenchmarkAgent:
             constrained = [e for e in candidates if e.params_m <= max_params]
             if constrained:
                 candidates = constrained
+
+        # Pretrain-data constraint — detect from task description.
+        # Block only truly-external corpora (JFT, LAION, LVD-142M). ImageNet-21K
+        # is now allowed per updated task constraints.
+        desc_low = (task.description or "").lower()
+        block_external = (
+            "laion" in desc_low or "jft" in desc_low or "lvd-142m" in desc_low
+            or "proprietary" in desc_low or "external" in desc_low
+        )
+        if block_external:
+            def _is_external(entry) -> bool:
+                low = entry.model_name.lower()
+                # Keep in21k/in22k (fine-tuned on ImageNet), drop pure external corpora
+                return any(bad in low for bad in ("laion", "jft", "lvd142m", "dinov2", "clip", "datacomp"))
+
+            compliant = [e for e in candidates if not _is_external(e)]
+            dropped = [e.model_name for e in candidates if _is_external(e)]
+            if compliant:
+                if dropped:
+                    logger.info(
+                        "Constraint filter (block external corpora) removed %d entries: %s",
+                        len(dropped), dropped[:5],
+                    )
+                candidates = compliant
 
         # Default: recommend overall rank 1 among candidates
         best = min(candidates, key=lambda e: e.overall_rank)
@@ -239,9 +614,14 @@ class BenchmarkAgent:
         leaderboard.recommendation = best.model_name
         leaderboard.recommendation_reason = llm_reason
 
+        # Top-K candidates for downstream Research Agent (compliant entries only).
+        # Limited to the top-3 by overall_rank to keep the baseline pass fast.
+        leaderboard.candidates = [e.model_name for e in candidates[:3]]
+
         logger.info(
-            "Recommendation: %s (rank=%d, params=%.0fM)",
+            "Recommendation: %s (rank=%d, params=%.0fM); top-K candidates=%s",
             best.model_name, best.overall_rank, best.params_m,
+            leaderboard.candidates,
         )
         return leaderboard
 

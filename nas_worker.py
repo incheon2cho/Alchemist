@@ -200,7 +200,19 @@ def build_model(arch: dict, num_classes: int, device: torch.device) -> nn.Module
         model_id, pretrained=True, num_classes=0,
         drop_path_rate=drop_path,
     )
-    embed_dim = model.num_features
+    # Get model's expected input size from pretrained config
+    data_cfg = timm.data.resolve_data_config(model.pretrained_cfg)
+    model_img_size = data_cfg.get("input_size", (3, 224, 224))[-1]
+    # Store in arch for build_loaders to use
+    arch["_model_img_size"] = model_img_size
+    logger.info("  Model input size: %d", model_img_size)
+
+    # Get actual output dim
+    with torch.no_grad():
+        dummy = torch.randn(1, 3, model_img_size, model_img_size)
+        actual_out = model(dummy)
+    embed_dim = actual_out.shape[-1]
+    del dummy, actual_out
 
     # Inject attention modules for ResNet-family
     add_se = arch.get("add_se", False)
@@ -327,11 +339,69 @@ class EMA:
                 self.backup[n] = p.data.clone()
                 p.data.copy_(self.shadow[n])
 
+    def state_dict(self):
+        return {k: v.cpu().clone() for k, v in self.shadow.items()}
+
     def restore(self, model):
         for n, p in model.named_parameters():
             if n in self.backup:
                 p.data.copy_(self.backup[n])
         self.backup = {}
+
+
+class SAM(torch.optim.Optimizer):
+    """Sharpness-Aware Minimization (Foret et al., 2020).
+
+    Wraps a base optimizer and adds perturbation step for flatter minima.
+    """
+
+    def __init__(self, params, base_optimizer_cls, rho=0.05, adaptive=False, **kwargs):
+        defaults = dict(rho=rho, adaptive=adaptive, **kwargs)
+        super().__init__(params, defaults)
+        self.base_optimizer = base_optimizer_cls(self.param_groups, **kwargs)
+        self.param_groups = self.base_optimizer.param_groups
+        self.defaults.update(self.base_optimizer.defaults)
+
+    @torch.no_grad()
+    def first_step(self):
+        """Ascend to the sharpest point."""
+        grad_norm = self._grad_norm()
+        for group in self.param_groups:
+            scale = group["rho"] / (grad_norm + 1e-12)
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                e_w = (torch.pow(p, 2) if group.get("adaptive") else 1.0) * p.grad * scale
+                p.add_(e_w)
+                self.state[p]["e_w"] = e_w
+
+    @torch.no_grad()
+    def second_step(self):
+        """Descend from the sharpest point (actual update)."""
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                p.sub_(self.state[p].get("e_w", 0))
+        self.base_optimizer.step()
+
+    @torch.no_grad()
+    def _grad_norm(self):
+        shared_device = self.param_groups[0]["params"][0].device
+        norm = torch.norm(
+            torch.stack([
+                ((torch.abs(p) if group.get("adaptive") else 1.0) * p.grad).norm(p=2).to(shared_device)
+                for group in self.param_groups for p in group["params"] if p.grad is not None
+            ]),
+            p=2,
+        )
+        return norm
+
+    def step(self, closure=None):
+        raise NotImplementedError("SAM uses first_step() and second_step()")
+
+    def zero_grad(self, set_to_none=False):
+        self.base_optimizer.zero_grad(set_to_none)
 
 
 # ============================================================
@@ -359,6 +429,10 @@ def run_training(task: dict, arch: dict, config: dict, trial_id: int) -> dict:
 
     # Build model and data
     model = build_model(arch, num_classes, device)
+    # Use model's native input size if available
+    if "_model_img_size" in arch:
+        config["img_size"] = arch["_model_img_size"]
+        logger.info("  Using model img_size: %d", config["img_size"])
     train_loader, val_loader = build_loaders(task, config)
 
     # Freeze backbone if backbone_lr_scale is 0 (linear probe mode)
@@ -468,9 +542,19 @@ def run_training(task: dict, arch: dict, config: dict, trial_id: int) -> dict:
     else:
         param_groups = [{"params": model.parameters(), "lr": lr}]
 
-    optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+    optimizer_name = config.get("optimizer", "adamw")
+    use_sam = optimizer_name == "sam"
+    sam_rho = config.get("sam_rho", 0.05)
+
+    if use_sam:
+        optimizer = SAM(param_groups, torch.optim.AdamW, rho=sam_rho, weight_decay=weight_decay)
+        logger.info("  Optimizer: SAM(AdamW, rho=%.3f)", sam_rho)
+    else:
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+        logger.info("  Optimizer: AdamW")
+
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-    scaler = GradScaler()
+    scaler = GradScaler(enabled=not use_sam)  # disable scaler for SAM (incompatible)
 
     # LR schedule
     lr_schedule = config.get("lr_schedule", "onecycle")
@@ -532,12 +616,30 @@ def run_training(task: dict, arch: dict, config: dict, trial_id: int) -> dict:
                 else:
                     loss = criterion(out, tgts)
 
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            if use_sam:
+                # SAM two-step: 1) compute grad → ascend, 2) recompute grad → descend
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.first_step()
+
+                # Second forward-backward pass
+                with autocast(device_type="cuda"):
+                    out2 = model(imgs)
+                    if apply_mix:
+                        loss2 = lam * criterion(out2, tgts_a) + (1 - lam) * criterion(out2, tgts_b)
+                    else:
+                        loss2 = criterion(out2, tgts)
+                optimizer.zero_grad()
+                loss2.backward()
+                optimizer.second_step()
+            else:
+                optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+
             if step_per_batch:
                 scheduler.step()
             epoch_loss += loss.item()
