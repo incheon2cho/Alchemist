@@ -924,15 +924,26 @@ class ResearchAgent:
         self,
         config: TrialConfig,
         failures: list[tuple[str, TrialConfig]],
+        recent_successes: int = 0,
     ) -> TrialConfig:
         """Modify an upcoming trial's config based on prior-trial failure
-        reasons. Simple rule-based adaptation that prevents the same failure
-        recurring on similar configs.
+        reasons. Rule-based adaptation. Environmental failures (OOM) are
+        forgiven after ``recent_successes >= 2`` consecutive clean trials
+        (e.g., when the OOM was caused by transient concurrent GPU use).
         """
         from dataclasses import replace
         if not failures:
             return config
         adapted = config
+        # Recent-successes gate: if we've had >=2 clean trials in a row since
+        # the last OOM, stop treating OOM as a persistent constraint.
+        oom_active = True
+        if recent_successes >= 2:
+            oom_active = False
+            logger.info(
+                "[adapt] OOM constraint lifted after %d consecutive successes",
+                recent_successes,
+            )
         # Build a set of observed failure modes
         modes = {mode for mode, _ in failures}
         # Catastrophic forgetting → cap lr on unfreeze trials
@@ -952,8 +963,8 @@ class ResearchAgent:
             if adapted.lr > 3e-4:
                 logger.info("[adapt] lowering lr → 3e-4 (prior divergence)")
                 adapted = replace(adapted, lr=3e-4)
-        # OOM → halve batch
-        if "oom" in "|".join(modes).lower() and adapted.batch_size > 32:
+        # OOM → halve batch (only if constraint still active)
+        if oom_active and "oom" in "|".join(modes).lower() and adapted.batch_size > 32:
             new_bs = max(32, adapted.batch_size // 2)
             logger.info("[adapt] batch_size %d → %d (prior OOM)",
                         adapted.batch_size, new_bs)
@@ -973,10 +984,13 @@ class ResearchAgent:
         total_time = 0.0
         best_so_far = baseline_score
         failures: list[tuple[str, TrialConfig]] = []  # for adaptive tuning
+        consecutive_clean = 0  # successes in a row since last OOM
 
         for i, config in enumerate(configs):
             # Adapt config based on prior failures within this round
-            config = self._adapt_config_from_failures(config, failures)
+            config = self._adapt_config_from_failures(
+                config, failures, recent_successes=consecutive_clean,
+            )
             if total_time / 3600 > budget_hours:
                 logger.warning("Budget exceeded after %d trials", i)
                 break
@@ -991,6 +1005,9 @@ class ResearchAgent:
                 total_time += result.elapsed_s
                 if result.score > best_so_far:
                     best_so_far = result.score
+                # Count clean success (no OOM) towards "OOM forgiveness".
+                if result.score >= baseline_score * 0.5:
+                    consecutive_clean += 1
 
                 logger.info(
                     "Trial %d/%d: lr=%.4f freeze=%s adapter=%s → %.1f%% (%.0fs)",
@@ -1005,6 +1022,7 @@ class ResearchAgent:
                         i + 1, config.freeze_backbone, config.batch_size,
                     )
                     failures.append(("oom", config))
+                    consecutive_clean = 0  # reset on new OOM
                     import gc
                     gc.collect()
                     try:
