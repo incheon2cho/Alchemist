@@ -32,11 +32,14 @@ bottom-right.
 
 (2) CONTROLLER AGENT (center, large slate rounded rectangle):
    - Title: "Controller Agent" (largest box, central authority)
-   - Inside, four stacked actions top-to-bottom:
+   - Inside, FIVE stacked actions top-to-bottom:
        "1. Direct Benchmark Agent",
        "2. Validate & pick Winner (top-K baseline eval)",
        "3. Direct Research Agent",
-       "4. Judge final result (ship / iterate)"
+       "4. Mid-trial early-stop guardrail (vision-aware)",
+       "5. Judge final result (ship / iterate)"
+   - Small pill-shaped badge next to action 4 reading
+     "val < baseline − 10%p  |  val + 5%p < best  |  train_loss > 3"
    - Left bidirectional arrow to Benchmark Agent
    - Right bidirectional arrow to Research Agent
    - Small dashed arrow down to AWS EC2 GPU icon labeled
@@ -54,13 +57,17 @@ bottom-right.
 
 (4) RESEARCH AGENT (right column, teal accent):
    - Large rounded rectangle labeled "Research Agent"
-   - Inside, a circular self-refinement loop with three nodes connected
+   - Inside, a circular self-refinement loop with FOUR nodes connected
      by curved arrows:
        R0 "Baseline eval",
-       R1 "Grid search (lr × freeze × adapter)",
-       R2 "LLM-guided refinement + SoTA-gap analysis"
+       R1 "Grid search (lr × freeze × adapter × advanced-tech)",
+       R2 "LLM-guided refinement + SoTA-gap analysis",
+       ADAPT "Adaptive tuning from failures"
+   - Small side label near ADAPT: "catastrophic→lr cap | divergence→aug↓ | OOM→batch÷2"
    - Loop arrow from R2 back to R1 labeled "continue if gap remains"
-   - Bidirectional arrow to Controller labeled "directive / result"
+   - Bidirectional arrow to Controller labeled "directive / result / progress"
+   - A small cylinder icon labeled "Experience Store" below Research Agent,
+     connected by a read-write arrow labeled "record / retrieve similar task"
    - Final output arrow exiting bottom-right to a box:
      "Trained checkpoint + report" with a small trophy icon
 
@@ -68,7 +75,11 @@ Global:
 - Controller is visually the LARGEST and CENTRAL element
 - Benchmark and Research are SUBORDINATE, flanking left and right
 - All arrows show Controller initiating (solid) and receiving (dashed)
-- Tiny footer: "ImageNet-1K / 21K allowed · JFT, LAION, LVD-142M blocked"
+- A horizontal dashed band between Controller and Research shows the
+  "per-epoch progress.json" stream feeding Controller's early-stop rule
+- Experience Store cylinder below Research, with persistent-memory icon
+- Tiny footer: "ImageNet-1K / 21K allowed · JFT, LAION, LVD-142M blocked ·
+  Cross-task memory accumulates as tasks complete"
 - No 3D, no drop shadows, crisp labels, IEEE-paper-friendly
 ```
 
@@ -135,6 +146,48 @@ Thin horizontal arrow at bottom connecting both lanes to shared final box:
    "Benchmark comparison: CIFAR-100 / Butterfly / Shopee-IET"
 
 No 3D, crisp text labels, IEEE-paper-friendly style.
+```
+
+---
+
+## Prompt v4 — Two-Level Memory Figure (supporting claim)
+
+Use this as a Figure 3 illustrating Alchemist's distinguishing memory
+architecture: within-round adaptive tuning + cross-task experience.
+
+```
+A minimal, clean diagram for an academic ML paper, landscape 16:9, white
+background, thin gray strokes, restrained palette (teal + amber), sans-serif
+labels. Title: "Alchemist Research Agent: Two-Level Memory".
+
+LEFT PANEL — "Within-Round Adaptive Tuning" (teal):
+   Circular loop with three nodes:
+     "Trial N" → "Outcome classifier" → "_adapt_config_from_failures()"
+     → back to "Trial N+1"
+   Three small branch labels from the classifier:
+     "catastrophic (val < baseline−10%p) → cap lr",
+     "divergence (train_loss > 3) → mixup α ↓ + lr ↓",
+     "OOM → batch ÷ 2"
+   Caption: "Agent avoids repeating the same failure within a round"
+
+RIGHT PANEL — "Cross-Task Experience Memory" (amber):
+   Horizontal pipeline of three tasks:
+     [CIFAR-100] → [Butterfly] → [Shopee-IET]
+   Below each task, a small cylinder icon connects upward:
+     Cylinder labeled "Experience Store
+                       (~/.cache/alchemist/experience.jsonl)"
+   After CIFAR completes: arrow from CIFAR → cylinder labeled "record"
+   Before Butterfly starts: arrow from cylinder → Butterfly labeled
+     "retrieve similar (num_classes bucket + keyword Jaccard)"
+   Small side label: "CIFAR winning config (lr, mixup, ema) → Butterfly LLM
+   prompt as prior"
+   Caption: "Agent becomes a progressively more expert vision researcher"
+
+Connecting insight text between panels:
+   "Within-round: fast failure avoidance.
+    Cross-task: persistent expertise accumulation."
+
+No 3D, crisp text, IEEE-paper-friendly.
 ```
 
 ---

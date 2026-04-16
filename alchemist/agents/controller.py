@@ -174,6 +174,59 @@ class ControllerAgent:
         return "\n".join(f"[{c['role']}] {c['content']}" for c in self._context)
 
     # ------------------------------------------------------------------
+    # Mid-trial guardrail — Vision-aware early-stop decision
+    # ------------------------------------------------------------------
+
+    def evaluate_trial_progress(
+        self,
+        progress: dict[str, Any],
+        baseline_score: float,
+        best_so_far: float,
+    ) -> tuple[bool, str]:
+        """Decide whether a mid-training trial should continue.
+
+        Applies four vision-aware heuristics on the latest epoch snapshot:
+          (1) **Catastrophic forgetting**: val_acc < baseline - 10 %p at epoch ≥ 3
+              (typical sign of too-high lr on a pretrained backbone).
+          (2) **Hopeless vs best-so-far**: at epoch ≥ 5, val_acc + 5 %p < best_so_far
+              with val_acc already > 0 — remaining epochs can't close the gap.
+          (3) **Training divergence**: train_loss > 3.0 at epoch ≥ 3 (for a
+              cross-entropy classifier) — the optimizer is unstable.
+          (4) **Plateau below threshold**: val_acc hasn't improved for 3 epochs
+              AND val_acc < 0.9 × best_so_far (not implemented here;
+              requires caller to track history).
+
+        Returns ``(keep, reason)``.
+        """
+        epoch = int(progress.get("epoch", 0))
+        val = float(progress.get("val_acc", 0.0))
+        train_loss = float(progress.get("train_loss", 0.0))
+        total = int(progress.get("total_epochs", 10))
+
+        # Rule (1): catastrophic forgetting — only after warmup has ended.
+        if epoch >= 3 and val < baseline_score - 10.0:
+            return False, (
+                f"epoch {epoch}/{total}: val={val:.1f}% is > 10 %p below pretrain "
+                f"baseline {baseline_score:.1f}% — catastrophic forgetting"
+            )
+
+        # Rule (2): hopeless — can't close gap to best_so_far in remaining epochs.
+        if best_so_far > 0 and epoch >= 5 and val > 0 and val + 5.0 < best_so_far:
+            return False, (
+                f"epoch {epoch}/{total}: val={val:.1f}% still > 5 %p below "
+                f"best_so_far {best_so_far:.1f}% — hopeless"
+            )
+
+        # Rule (3): optimizer divergence (classifier CE loss).
+        if epoch >= 3 and train_loss > 3.0:
+            return False, (
+                f"epoch {epoch}/{total}: train_loss={train_loss:.2f} "
+                f"> 3.0 — optimizer divergence"
+            )
+
+        return True, f"continue (epoch {epoch}/{total}, val={val:.1f}%)"
+
+    # ------------------------------------------------------------------
     # Ship judgment (기준 기반, 세부 분석은 Research가 담당)
     # ------------------------------------------------------------------
 

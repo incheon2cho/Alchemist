@@ -603,6 +603,25 @@ def run_training(base_model: str, task: dict, config: dict, trial_id: int) -> di
                 logger.info("  Epoch %d/%d, train=%.4f, val=%.2f%%, best=%.2f%%",
                             epoch + 1, epochs, train_loss, epoch_score, best_score)
 
+            # Write per-epoch progress file for Controller early-stop monitoring.
+            import os as _os2
+            _prog_path = _os2.environ.get("ALCHEMIST_PROGRESS_PATH")
+            if _prog_path:
+                try:
+                    import json as _json
+                    _prog = {
+                        "epoch": int(epoch + 1),
+                        "total_epochs": int(epochs),
+                        "train_loss": float(train_loss),
+                        "val_acc": float(epoch_score),
+                        "best_so_far": float(best_score),
+                        "elapsed_s": float(time.time() - t0),
+                    }
+                    with open(_prog_path, "w") as _pf:
+                        _json.dump(_prog, _pf)
+                except Exception:
+                    pass
+
         score = best_score
         ckpt_state = best_state or train_model.state_dict()
 
@@ -645,7 +664,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Alchemist Training Worker")
     parser.add_argument("--job", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--progress",
+                        help="Path to write per-epoch progress JSON for Controller early-stop.")
     args = parser.parse_args()
+
+    if args.progress:
+        # Make the progress path available to run_training via env var
+        import os as _os
+        _os.environ["ALCHEMIST_PROGRESS_PATH"] = args.progress
 
     job_path = Path(args.job)
     if not job_path.exists():

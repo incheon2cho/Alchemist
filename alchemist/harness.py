@@ -71,6 +71,9 @@ class ThreeAgentHarness:
             max_rounds=max_rounds,
             log_dir=log_dir,
         )
+        # Wire Controller into Research so mid-trial early-stop can consult
+        # Controller.evaluate_trial_progress for each epoch snapshot.
+        self.research.controller = self.controller
         self.bus = MessageBus(log_dir=log_dir)
         self.human_gate = human_gate or self._default_human_gate
         self.state = ExperimentState()

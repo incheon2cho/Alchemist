@@ -145,6 +145,16 @@ class ResearchAgent:
                 logger.warning("ArxivRetriever unavailable (%s)", e)
                 self.enable_retrieval = False
 
+        # Persistent cross-task experience memory. Retrieved at the start of
+        # a run to prime the LLM with prior winning configs on similar tasks;
+        # appended to at the end of a run so the next task benefits.
+        try:
+            from alchemist.core.experience_store import VisionExperienceStore
+            self.experience = VisionExperienceStore()
+        except Exception as e:
+            logger.warning("VisionExperienceStore unavailable (%s)", e)
+            self.experience = None
+
     def handle_directive(
         self,
         msg: AgentMessage,
@@ -229,7 +239,10 @@ class ResearchAgent:
                 break
 
             # 2b. Run trials
-            trials = self.run_trials(base_model, task, configs, remaining_budget)
+            trials = self.run_trials(
+                base_model, task, configs, remaining_budget,
+                baseline_score=baseline,
+            )
             all_trials.extend(trials)
             round_time = sum(t.elapsed_s for t in trials)
             total_budget_used += round_time / 3600
@@ -315,6 +328,34 @@ class ResearchAgent:
             "total_trials": len(all_trials),
             "total_rounds": min(round_num, self.max_rounds),
         })
+
+        # Persist experience for future runs on similar tasks.
+        if self.experience is not None:
+            try:
+                best_cfg_d = safe_asdict(best_trial.config)
+                techniques = [
+                    k for k in ("mixup", "cutmix", "randaugment", "ema")
+                    if best_cfg_d.get(k)
+                ]
+                if best_cfg_d.get("optimizer") and best_cfg_d["optimizer"] != "adamw":
+                    techniques.append(f"opt={best_cfg_d['optimizer']}")
+                if best_cfg_d.get("backbone_lr_scale", 1.0) < 1.0:
+                    techniques.append(f"llrd={best_cfg_d['backbone_lr_scale']}")
+                self.experience.record(
+                    task_name=task.name,
+                    task_description=task.description,
+                    num_classes=task.num_classes,
+                    base_model=base_model,
+                    baseline_score=baseline,
+                    best_score=best_trial.score,
+                    best_config=best_cfg_d,
+                    techniques_tried=techniques,
+                    summary=(report[:300] if isinstance(report, str) else ""),
+                    rounds_run=min(round_num, self.max_rounds),
+                    total_trials=len(all_trials),
+                )
+            except Exception as e:
+                logger.warning("experience recording failed: %s", e)
 
         result = ResearchResult(
             base_model=base_model,
@@ -443,44 +484,82 @@ class ResearchAgent:
             for lr in DEFAULT_LR_CANDIDATES:
                 for freeze in freeze_options:
                     for adapter in ["linear_head", "none"]:
+                        # Unfreeze trials get advanced-technique defaults
+                        # (mixup/cutmix/EMA/label_smoothing/RandAug/LLRD) since
+                        # they benefit most. Freeze (linear-probe) trials keep
+                        # basic augmentation for a clean transfer-learning signal.
+                        advanced = not freeze
                         configs.append(TrialConfig(
                             lr=lr,
                             batch_size=_default_batch(params_m, freeze),
                             epochs=10,
-                            weight_decay=0.01,
+                            weight_decay=0.05 if advanced else 0.01,
                             scheduler="cosine",
-                            augmentation="basic",
+                            augmentation="advanced" if advanced else "basic",
                             freeze_backbone=freeze,
                             adapter=adapter,
+                            optimizer="adamw",
+                            mixup=advanced,
+                            mixup_alpha=0.8 if advanced else 0.2,
+                            cutmix=advanced,
+                            cutmix_alpha=1.0,
+                            randaugment=advanced,
+                            label_smoothing=0.1 if advanced else 0.0,
+                            ema=advanced,
+                            ema_decay=0.9999,
+                            warmup_epochs=2 if advanced else 0,
+                            backbone_lr_scale=0.7 if advanced else 1.0,
                         ))
         else:
-            # Round 2+: targeted refinement based on LLM analysis
-            # Ask LLM to suggest specific configs based on prior results
-            refine_prompt = (
-                f"Based on the prior analysis, suggest {remaining_trials} specific "
-                f"hyperparameter configurations as JSON array. Each config should have: "
-                f"lr (float), batch_size (int), freeze_backbone (bool), adapter (string: "
-                f"'none'/'linear_head'/'lora'), epochs (int).\n\n"
-                f"Prior analyses:\n" + "\n".join(prior_analysis or []) + "\n\n"
-                f"Return ONLY a JSON array of config objects."
-            )
-            llm_configs = safe_llm_call(
-                self.llm, refine_prompt,
-                fallback=[],
+            # Round 2+: LLM-driven advanced-technique refinement.
+            # Use suggest_techniques() to get configs with SAM/Mixup/CutMix/EMA
+            # etc. populated, based on R1 analysis + SoTA gap.
+            best_so_far = 0.0
+            # Try to pull best score from prior analyses text (best-effort)
+            for a in (prior_analysis or []):
+                import re as _re
+                m = _re.search(r"(\d+\.\d+)%", a)
+                if m:
+                    best_so_far = max(best_so_far, float(m.group(1)))
+
+            llm_configs = self.suggest_techniques(
+                task, best_so_far, sota_knowledge or "",
+                prior_analysis or [],
             )
 
             if isinstance(llm_configs, list) and llm_configs:
                 for cfg in llm_configs[:remaining_trials]:
                     if isinstance(cfg, dict):
                         configs.append(TrialConfig(
-                            lr=cfg.get("lr", 3e-4),
-                            batch_size=cfg.get("batch_size", 32),
-                            epochs=cfg.get("epochs", 10),
-                            weight_decay=cfg.get("weight_decay", 0.01),
+                            lr=float(cfg.get("lr", 3e-4)),
+                            batch_size=int(cfg.get("batch_size", 64)),
+                            epochs=int(cfg.get("epochs", 20)),
+                            weight_decay=float(cfg.get("weight_decay", 0.01)),
                             scheduler=cfg.get("scheduler", "cosine"),
-                            augmentation=cfg.get("augmentation", "basic"),
-                            freeze_backbone=cfg.get("freeze_backbone", True),
+                            augmentation=cfg.get("augmentation", "advanced"),
+                            freeze_backbone=bool(cfg.get("freeze_backbone", False)),
                             adapter=cfg.get("adapter", "linear_head"),
+                            optimizer=cfg.get("optimizer", "adamw"),
+                            mixup=bool(cfg.get("mixup", True)),
+                            mixup_alpha=float(cfg.get("mixup_alpha", 0.8)),
+                            cutmix=bool(cfg.get("cutmix", True)),
+                            cutmix_alpha=float(cfg.get("cutmix_alpha", 1.0)),
+                            randaugment=bool(cfg.get("randaugment", True)),
+                            label_smoothing=float(cfg.get("label_smoothing", 0.1)),
+                            ema=bool(cfg.get("ema", True)),
+                            ema_decay=float(cfg.get("ema_decay", 0.9999)),
+                            warmup_epochs=int(cfg.get("warmup_epochs", 5)),
+                            backbone_lr_scale=float(cfg.get("backbone_lr_scale", 0.7)),
+                            sam_rho=float(cfg.get("sam_rho", 0.05)),
+                            extra={k: v for k, v in cfg.items()
+                                   if k not in {
+                                       "lr", "batch_size", "epochs", "weight_decay",
+                                       "scheduler", "augmentation", "freeze_backbone",
+                                       "adapter", "optimizer", "mixup", "mixup_alpha",
+                                       "cutmix", "cutmix_alpha", "randaugment",
+                                       "label_smoothing", "ema", "ema_decay",
+                                       "warmup_epochs", "backbone_lr_scale", "sam_rho",
+                                   }},
                         ))
 
             # Fallback: if LLM didn't produce configs, add targeted variations
@@ -557,6 +636,19 @@ class ResearchAgent:
         if sota_standing and sota_standing.get("summary"):
             standing_text = sota_standing["summary"]
 
+        # 3. Cross-task experience (from prior completed runs)
+        experience_text = "(no prior experience on similar tasks)"
+        if self.experience is not None:
+            try:
+                past = self.experience.retrieve_similar(
+                    task.name, task.description, task.num_classes, top_k=3,
+                )
+                if past:
+                    experience_text = self.experience.summarize_for_prompt(past, max_chars=1800)
+                    logger.info("Experience retrieved: %d prior similar tasks", len(past))
+            except Exception as e:
+                logger.warning("experience retrieval failed: %s", e)
+
         prompt = (
             f"You are a computer vision research assistant. Use the evidence "
             f"below to analyse effective techniques for the task.\n\n"
@@ -566,6 +658,8 @@ class ResearchAgent:
             f"- Metric: {task.eval_metric}\n\n"
             f"## Current SoTA standing (from Benchmark Agent)\n"
             f"{standing_text}\n\n"
+            f"## Prior experience on similar vision tasks\n"
+            f"{experience_text}\n\n"
             f"## Recent arXiv papers (2023–2025)\n"
             f"{arxiv_text}\n\n"
             f"## Instructions\n"
@@ -826,26 +920,77 @@ class ResearchAgent:
         logger.info("Baseline %s on '%s': %.1f%%", base_model, task.name, score)
         return score
 
+    def _adapt_config_from_failures(
+        self,
+        config: TrialConfig,
+        failures: list[tuple[str, TrialConfig]],
+    ) -> TrialConfig:
+        """Modify an upcoming trial's config based on prior-trial failure
+        reasons. Simple rule-based adaptation that prevents the same failure
+        recurring on similar configs.
+        """
+        from dataclasses import replace
+        if not failures:
+            return config
+        adapted = config
+        # Build a set of observed failure modes
+        modes = {mode for mode, _ in failures}
+        # Catastrophic forgetting → cap lr on unfreeze trials
+        if "catastrophic" in "|".join(modes) and not adapted.freeze_backbone:
+            if adapted.lr > 1e-3:
+                logger.info(
+                    "[adapt] lowering lr %.1e → %.1e (prior catastrophic forgetting)",
+                    adapted.lr, 1e-3,
+                )
+                adapted = replace(adapted, lr=1e-3)
+        # Optimizer divergence → reduce augmentation strength
+        if "divergence" in "|".join(modes):
+            if adapted.mixup and adapted.mixup_alpha > 0.4:
+                adapted = replace(adapted, mixup_alpha=0.4)
+            if adapted.cutmix and adapted.cutmix_alpha > 0.5:
+                adapted = replace(adapted, cutmix_alpha=0.5)
+            if adapted.lr > 3e-4:
+                logger.info("[adapt] lowering lr → 3e-4 (prior divergence)")
+                adapted = replace(adapted, lr=3e-4)
+        # OOM → halve batch
+        if "oom" in "|".join(modes).lower() and adapted.batch_size > 32:
+            new_bs = max(32, adapted.batch_size // 2)
+            logger.info("[adapt] batch_size %d → %d (prior OOM)",
+                        adapted.batch_size, new_bs)
+            adapted = replace(adapted, batch_size=new_bs)
+        return adapted
+
     def run_trials(
         self,
         base_model: str,
         task: UserTask,
         configs: list[TrialConfig],
         budget_hours: float,
+        baseline_score: float = 0.0,
     ) -> list[TrialResult]:
         """Run all trial configurations and return results."""
         trials = []
         total_time = 0.0
+        best_so_far = baseline_score
+        failures: list[tuple[str, TrialConfig]] = []  # for adaptive tuning
 
         for i, config in enumerate(configs):
+            # Adapt config based on prior failures within this round
+            config = self._adapt_config_from_failures(config, failures)
             if total_time / 3600 > budget_hours:
                 logger.warning("Budget exceeded after %d trials", i)
                 break
 
             try:
-                result = self._run_single_trial(i + 1, base_model, task, config)
+                result = self._run_single_trial(
+                    i + 1, base_model, task, config,
+                    baseline_score=baseline_score,
+                    best_so_far=best_so_far,
+                )
                 trials.append(result)
                 total_time += result.elapsed_s
+                if result.score > best_so_far:
+                    best_so_far = result.score
 
                 logger.info(
                     "Trial %d/%d: lr=%.4f freeze=%s adapter=%s → %.1f%% (%.0fs)",
@@ -859,6 +1004,7 @@ class ResearchAgent:
                         "Trial %d OOM (freeze=%s, batch=%d) — skipping unfreeze configs",
                         i + 1, config.freeze_backbone, config.batch_size,
                     )
+                    failures.append(("oom", config))
                     import gc
                     gc.collect()
                     try:
@@ -870,10 +1016,23 @@ class ResearchAgent:
                         configs = [c for c in configs[i+1:] if c.freeze_backbone]
                 else:
                     logger.warning("Trial %d failed: %s", i + 1, e)
+                    failures.append(("error", config))
                 continue
             except Exception as e:
                 logger.warning("Trial %d failed: %s", i + 1, e)
+                failures.append(("error", config))
                 continue
+
+            # Classify outcome as failure/success for adaptive tuning.
+            if result.score < baseline_score - 5.0:
+                # Score well below baseline — treat as failure mode to adapt
+                if not config.freeze_backbone and config.lr >= 1e-3:
+                    failures.append(("catastrophic", config))
+                elif (
+                    getattr(result, "train_loss", 0.0) > 3.0
+                    or result.score < baseline_score * 0.7
+                ):
+                    failures.append(("divergence", config))
 
         logger.info(
             "Completed %d/%d trials in %.0fs",
@@ -933,6 +1092,21 @@ class ResearchAgent:
         base_model: str,
         task: UserTask,
         config: TrialConfig,
+        baseline_score: float = 0.0,
+        best_so_far: float = 0.0,
     ) -> TrialResult:
-        """Run a single trial via the configured executor."""
-        return self.executor.run_trial(trial_id, base_model, task, config)
+        """Run a single trial via the configured executor with Controller-based
+        mid-trial early stopping.
+        """
+        # Vision-aware early-stop: let Controller judge each epoch snapshot.
+        controller = getattr(self, "controller", None)
+        early_stop_fn = None
+        if controller is not None and hasattr(controller, "evaluate_trial_progress"):
+            def _fn(progress):
+                return controller.evaluate_trial_progress(
+                    progress, baseline_score, best_so_far,
+                )
+            early_stop_fn = _fn
+        return self.executor.run_trial(
+            trial_id, base_model, task, config, early_stop_fn=early_stop_fn,
+        )

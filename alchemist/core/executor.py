@@ -180,6 +180,7 @@ class AWSExecutor(TrainingExecutor):
         base_model: str,
         task: UserTask,
         config: TrialConfig,
+        early_stop_fn=None,
     ) -> TrialResult:
         job = {
             "command": "train",
@@ -194,7 +195,7 @@ class AWSExecutor(TrainingExecutor):
             },
             "config": _flatten_config(config),
         }
-        return self._submit_and_wait(job)
+        return self._submit_and_wait(job, early_stop_fn=early_stop_fn)
 
     def evaluate_baseline(self, base_model: str, task: UserTask) -> float:
         job = {
@@ -213,11 +214,23 @@ class AWSExecutor(TrainingExecutor):
         result = self._submit_and_wait(job)
         return result.score
 
-    def _submit_and_wait(self, job: dict[str, Any]) -> TrialResult:
-        """Submit a training job to AWS and poll until completion."""
+    def _submit_and_wait(
+        self,
+        job: dict[str, Any],
+        early_stop_fn=None,  # callable(progress: dict) -> (keep, reason)
+    ) -> TrialResult:
+        """Submit a training job to AWS and poll until completion.
+
+        If ``early_stop_fn`` is given, the poll loop also reads the per-epoch
+        progress file on the remote host and invokes the callback. When the
+        callback returns ``keep=False``, the running train_worker PID is
+        SSH-killed and a partial result is returned (status=ok, score = last
+        val_acc, early_stopped=True).
+        """
         job_id = f"trial_{job['trial_id']}_{int(time.time())}"
         job_file = f"{self.remote_work_dir}/jobs/{job_id}.json"
         result_file = f"{self.remote_work_dir}/jobs/{job_id}_result.json"
+        progress_file = f"{self.remote_work_dir}/jobs/{job_id}_progress.json"
 
         # Ensure jobs directory exists
         self._ssh_cmd(f"mkdir -p {self.remote_work_dir}/jobs")
@@ -241,8 +254,9 @@ class AWSExecutor(TrainingExecutor):
             self.host,
             (
                 f"cd {self.remote_work_dir} && "
-                f"nohup {self.remote_python} train_worker.py "
+                f"PYTHONUNBUFFERED=1 nohup {self.remote_python} train_worker.py "
                 f"--job {job_file} --output {result_file} "
+                f"--progress {progress_file} "
                 f"> {self.remote_work_dir}/jobs/{job_id}.log 2>&1 "
                 f"< /dev/null &"
             ),
@@ -256,12 +270,55 @@ class AWSExecutor(TrainingExecutor):
         time.sleep(3)  # brief pause for SSH to deliver command
         logger.info("Submitted job %s to %s", job_id, self.host)
 
-        # Poll for result
+        # Poll for result (and mid-trial progress for early-stop)
         max_wait = 3600 * 4  # 4 hours max
         elapsed = 0
+        last_progress_epoch = -1
         while elapsed < max_wait:
             time.sleep(self.poll_interval)
             elapsed += self.poll_interval
+
+            # Early-stop monitoring: read progress.json from remote, invoke callback.
+            if early_stop_fn is not None:
+                prog_check = self._ssh_cmd(
+                    f"cat {progress_file} 2>/dev/null", timeout=10,
+                )
+                if prog_check.returncode == 0 and prog_check.stdout.strip():
+                    try:
+                        prog = json.loads(prog_check.stdout.strip())
+                        cur_epoch = int(prog.get("epoch", 0))
+                        if cur_epoch != last_progress_epoch:
+                            last_progress_epoch = cur_epoch
+                            keep, reason = early_stop_fn(prog)
+                            logger.info(
+                                "[early-stop] trial %s epoch %d: keep=%s (%s)",
+                                job_id, cur_epoch, keep, reason,
+                            )
+                            if not keep:
+                                logger.warning(
+                                    "[early-stop] KILL trial %s: %s", job_id, reason,
+                                )
+                                # SSH-kill train_worker for this job
+                                self._ssh_cmd(
+                                    f"pgrep -f 'train_worker.py --job.*{job_id}' "
+                                    f"| xargs -r kill -9",
+                                    timeout=15,
+                                )
+                                # Synthesize early-stopped result locally
+                                return TrialResult(
+                                    trial_id=job["trial_id"],
+                                    config=TrialConfig(
+                                        **{k: v for k, v in (job.get("config") or {}).items()
+                                           if k in {f.name for f in
+                                                    TrialConfig.__dataclass_fields__.values()}}
+                                    ),
+                                    score=float(prog.get("val_acc", 0.0)),
+                                    train_loss=float(prog.get("train_loss", 0.0)),
+                                    val_loss=0.0,
+                                    elapsed_s=float(prog.get("elapsed_s", elapsed)),
+                                )
+                    except (ValueError, KeyError):
+                        pass
 
             check = self._ssh_cmd(f"cat {result_file} 2>/dev/null", timeout=15)
             if check.returncode == 0 and check.stdout.strip():

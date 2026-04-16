@@ -71,6 +71,19 @@ class TrialConfig:
     augmentation: str = "basic"
     freeze_backbone: bool = True
     adapter: str = "none"                 # "none" | "lora" | "linear_head"
+    # Advanced techniques — propagated to train_worker.py
+    optimizer: str = "adamw"              # "adamw" | "sgd" | "sam"
+    mixup: bool = False
+    mixup_alpha: float = 0.2
+    cutmix: bool = False
+    cutmix_alpha: float = 1.0
+    randaugment: bool = False
+    label_smoothing: float = 0.0
+    ema: bool = False
+    ema_decay: float = 0.9999
+    warmup_epochs: int = 0
+    backbone_lr_scale: float = 1.0        # LLRD (layer-wise LR decay)
+    sam_rho: float = 0.05
     extra: dict[str, Any] = field(default_factory=dict)
 
 
