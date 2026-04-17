@@ -515,14 +515,24 @@ def run_training(base_model: str, task: dict, config: dict, trial_id: int) -> di
             logger.info("  LR schedule: Warmup+Cosine (min_lr=%s)", min_lr)
 
         else:
-            # Default: warmup + cosine (original)
+            # Default: warmup + cosine with floor.
+            # Auto-scale warmup if too short relative to total epochs
+            # (avoids instability from abrupt warmup→decay transition in long runs).
+            if warmup_epochs > 0 and warmup_epochs < max(2, int(epochs * 0.1)):
+                warmup_epochs = max(2, int(epochs * 0.1))
+                warmup_steps = warmup_epochs * steps_per_epoch
+                logger.info("  [auto-adjust] warmup scaled to %d epochs (10%% of %d)",
+                            warmup_epochs, epochs)
+            # LR floor: never decay below 1e-7 (prevents NaN from near-zero updates)
+            lr_floor = max(1e-7, lr * 0.01)
             def lr_lambda(step):
                 if step < warmup_steps and warmup_steps > 0:
                     return step / warmup_steps
                 progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-                return 0.5 * (1 + math.cos(math.pi * progress))
+                cosine = 0.5 * (1 + math.cos(math.pi * progress))
+                return max(cosine, lr_floor / lr)
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-            logger.info("  LR schedule: Warmup+Cosine (warmup=%d ep)", warmup_epochs)
+            logger.info("  LR schedule: Warmup+Cosine (warmup=%d ep, floor=%.1e)", warmup_epochs, lr_floor)
 
         train_loss = 0.0
         val_loss = 0.0
@@ -566,6 +576,11 @@ def run_training(base_model: str, task: dict, config: dict, trial_id: int) -> di
             if not step_per_batch:
                 scheduler.step(epoch)
             train_loss = epoch_loss / len(train_loader)
+
+            # NaN guard: detect diverged training and halt early.
+            if math.isnan(train_loss) or math.isinf(train_loss):
+                logger.warning("  NaN/Inf detected at epoch %d — halting training", epoch + 1)
+                break
 
             # Update EMA after each epoch
             if ema:

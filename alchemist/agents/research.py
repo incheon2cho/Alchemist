@@ -350,7 +350,16 @@ class ResearchAgent:
                     best_score=best_trial.score,
                     best_config=best_cfg_d,
                     techniques_tried=techniques,
-                    summary=(report[:300] if isinstance(report, str) else ""),
+                    summary=(
+                        (report[:300] if isinstance(report, str) else "")
+                        + (
+                            " WARNING: mid-training collapse detected on long-epoch "
+                            "trials (>10 ep) — keep epochs<=10 or increase warmup to 15%."
+                            if any(t.score < 5.0 and t.config.epochs > 10 for t in all_trials
+                                   if not t.config.freeze_backbone)
+                            else ""
+                        )
+                    ),
                     rounds_run=min(round_num, self.max_rounds),
                     total_trials=len(all_trials),
                 )
@@ -969,6 +978,30 @@ class ResearchAgent:
             logger.info("[adapt] batch_size %d → %d (prior OOM)",
                         adapted.batch_size, new_bs)
             adapted = replace(adapted, batch_size=new_bs)
+
+        # Mid-training collapse → shorten epochs + increase warmup ratio +
+        # ensure batch >= 64 (gradient stability)
+        if "collapse" in "|".join(modes) and not adapted.freeze_backbone:
+            max_safe_epochs = 10  # proven stable in R1
+            if adapted.epochs > max_safe_epochs:
+                logger.info(
+                    "[adapt] epochs %d → %d (prior mid-training collapse)",
+                    adapted.epochs, max_safe_epochs,
+                )
+                adapted = replace(adapted, epochs=max_safe_epochs)
+            # Warmup at least 10% of epochs
+            min_warmup = max(2, int(adapted.epochs * 0.15))
+            if adapted.warmup_epochs < min_warmup:
+                logger.info(
+                    "[adapt] warmup_epochs %d → %d (15%% of epochs)",
+                    adapted.warmup_epochs, min_warmup,
+                )
+                adapted = replace(adapted, warmup_epochs=min_warmup)
+            # Batch size floor for gradient stability
+            if adapted.batch_size < 64:
+                logger.info("[adapt] batch_size %d → 64 (gradient stability for long FT)",
+                            adapted.batch_size)
+                adapted = replace(adapted, batch_size=64)
         return adapted
 
     def run_trials(
@@ -1051,6 +1084,18 @@ class ResearchAgent:
                     or result.score < baseline_score * 0.7
                 ):
                     failures.append(("divergence", config))
+
+                # Mid-training collapse detection: if a long trial (epochs>10)
+                # scores < 5% (near-random), the model likely collapsed
+                # after initial convergence due to LR/numerical instability.
+                if config.epochs > 10 and result.score < 5.0:
+                    failures.append(("collapse", config))
+                    logger.warning(
+                        "[adapt] mid-training collapse detected (score=%.1f%% with "
+                        "%d epochs) — will shorten epochs + increase warmup ratio "
+                        "for future long-training trials",
+                        result.score, config.epochs,
+                    )
 
         logger.info(
             "Completed %d/%d trials in %.0fs",
