@@ -511,8 +511,8 @@ class ResearchAgent:
                 if freeze:
                     return 128  # linear probe / no grad on backbone
                 if params_m >= 50:
-                    return 32   # large model + EMA + Mixup/CutMix = ~20GB at batch 32
-                return 64
+                    return 16   # large model + SAM 2-step + EMA + 256px = tight on A10G 24GB
+                return 32
             params_m = 0.0
             for name, info in [
                 ("dinov2_vitb14", {"params_m": 86}),

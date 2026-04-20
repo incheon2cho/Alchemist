@@ -88,6 +88,13 @@ class BenchmarkAgent:
                 self.arxiv = ArxivRetriever()
             except Exception as e:
                 logger.warning("ArxivRetriever unavailable (%s); arXiv evidence disabled", e)
+        self.github = None
+        if enable_retrieval:
+            try:
+                from alchemist.core.retrievers import GitHubRetriever
+                self.github = GitHubRetriever()
+            except Exception as e:
+                logger.warning("GitHubRetriever unavailable (%s); GitHub evidence disabled", e)
 
     def handle_directive(
         self,
@@ -351,7 +358,35 @@ class BenchmarkAgent:
             except Exception as e:
                 logger.warning("arXiv scout failed: %s", e)
 
-        # 5. LLM suggestions grounded in all three evidence streams (PwC + HF + arXiv)
+        # 5. GitHub — model repos with pretrained weights / torch.hub
+        github_evidence = ""
+        if task and self.github is not None:
+            try:
+                repos = self.github.search_vision_models(
+                    task_name=task.name,
+                    architecture=query,
+                    top_k=5,
+                )
+                if repos:
+                    for r in repos:
+                        name = r["full_name"]
+                        if name not in seen:
+                            models.append({
+                                "name": name,
+                                "source": "github",
+                                "stars": r.get("stars", 0),
+                                "has_hubconf": r.get("has_hubconf", False),
+                                "has_weights": r.get("has_weights", False),
+                                "description": r.get("description", ""),
+                                "url": r.get("url", ""),
+                            })
+                            seen.add(name)
+                    github_evidence = self.github.summarize_for_llm(repos, max_chars=1500)
+                    logger.info("GitHub scout for '%s': +%d repos", task.name, len(repos))
+            except Exception as e:
+                logger.warning("GitHub scout failed: %s", e)
+
+        # 6. LLM suggestions grounded in all four evidence streams
         ctx_parts = []
         if pwc_evidence:
             ctx_parts.append(f"PwC SoTA for task:\n{pwc_evidence}")
@@ -359,6 +394,8 @@ class BenchmarkAgent:
             ctx_parts.append(f"HuggingFace Hub candidates:\n{hub_evidence}")
         if arxiv_evidence:
             ctx_parts.append(f"Recent arXiv papers on this task:\n{arxiv_evidence}")
+        if github_evidence:
+            ctx_parts.append(f"GitHub model repos:\n{github_evidence}")
         ctx = "\n\n".join(ctx_parts) or "(no retrieval evidence)"
         llm_result = safe_llm_call(
             self.llm,

@@ -8,6 +8,7 @@ Design principles:
 """
 
 from .arxiv import ArxivRetriever
+from .github import GitHubRetriever
 from .hf_hub import HFHubRetriever
 
-__all__ = ["ArxivRetriever", "HFHubRetriever"]
+__all__ = ["ArxivRetriever", "GitHubRetriever", "HFHubRetriever"]
