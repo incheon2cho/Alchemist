@@ -526,49 +526,34 @@ class ResearchAgent:
                 if name in base_model:
                     params_m = info["params_m"]
                     break
-            # SAM-focused grid: unfreeze trials sweep lr × rho.
-            # Freeze trials (baseline reference) use AdamW.
+            # SAM-only unfreeze grid: skip freeze trials (baseline already
+            # measured separately; freeze consistently 10%+ below unfreeze).
+            # Sweep: lr × rho, all with advanced-tech defaults.
             sam_rhos = [0.02, 0.05, 0.1]  # conservative / standard / aggressive
             for lr in DEFAULT_LR_CANDIDATES:
-                for freeze in freeze_options:
-                    if freeze:
-                        # Single freeze baseline per lr (fast, AdamW)
-                        configs.append(TrialConfig(
-                            lr=lr,
-                            batch_size=_default_batch(params_m, True),
-                            epochs=5,
-                            weight_decay=0.01,
-                            scheduler="cosine",
-                            augmentation="basic",
-                            freeze_backbone=True,
-                            adapter="linear_head",
-                            optimizer="adamw",
-                        ))
-                    else:
-                        # SAM unfreeze: sweep rho values per lr
-                        for rho in sam_rhos:
-                            configs.append(TrialConfig(
-                                lr=lr,
-                                batch_size=_default_batch(params_m, False),
-                                epochs=20,
-                                weight_decay=0.02,
-                                scheduler="cosine",
-                                augmentation="advanced",
-                                freeze_backbone=False,
-                                adapter="linear_head",
-                                optimizer="sam",
-                                sam_rho=rho,
-                                mixup=True,
-                                mixup_alpha=0.3,
-                                cutmix=True,
-                                cutmix_alpha=0.5,
-                                randaugment=True,
-                                label_smoothing=0.1,
-                                ema=True,
-                                ema_decay=0.9999,
-                                warmup_epochs=2,
-                                backbone_lr_scale=0.7,
-                            ))
+                for rho in sam_rhos:
+                    configs.append(TrialConfig(
+                        lr=lr,
+                        batch_size=_default_batch(params_m, False),
+                        epochs=20,
+                        weight_decay=0.02,
+                        scheduler="cosine",
+                        augmentation="advanced",
+                        freeze_backbone=False,
+                        adapter="linear_head",
+                        optimizer="sam",
+                        sam_rho=rho,
+                        mixup=True,
+                        mixup_alpha=0.3,
+                        cutmix=True,
+                        cutmix_alpha=0.5,
+                        randaugment=True,
+                        label_smoothing=0.1,
+                        ema=True,
+                        ema_decay=0.9999,
+                        warmup_epochs=2,
+                        backbone_lr_scale=0.7,
+                    ))
         else:
             # Round 2+: LLM-driven advanced-technique refinement.
             # Use suggest_techniques() to get configs with SAM/Mixup/CutMix/EMA
