@@ -364,6 +364,14 @@ def run_training(base_model: str, task: dict, config: dict, trial_id: int) -> di
     import torch.nn as nn
     from torch.amp import GradScaler, autocast
 
+    # Use bfloat16 if GPU supports it (Ampere+: A10G, A100, H100).
+    # bf16 has fp32-like exponent range → no overflow → no NaN collapse
+    # on long training runs. fp16 overflows after ~10 epochs on large models.
+    _use_bf16 = torch.cuda.is_bf16_supported()
+    _amp_dtype = torch.bfloat16 if _use_bf16 else torch.float16
+    if _use_bf16:
+        logger.info("  Using bfloat16 mixed precision (no GradScaler needed)")
+
     t0 = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_classes = task.get("num_classes", 100)
@@ -386,7 +394,7 @@ def run_training(base_model: str, task: dict, config: dict, trial_id: int) -> di
     train_loader, val_loader = build_loaders(task, config)
 
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-    scaler = GradScaler()
+    scaler = GradScaler(enabled=not _use_bf16)  # bf16 doesn't need scaler
 
     if freeze:
         # --- Feature extraction mode ---
@@ -556,7 +564,7 @@ def run_training(base_model: str, task: dict, config: dict, trial_id: int) -> di
                     else:
                         tgts_a, tgts_b, lam = tgts, tgts, 1.0
 
-                with autocast(device_type="cuda"):
+                with autocast(device_type="cuda", dtype=_amp_dtype):
                     out = train_model(imgs)
                     if apply_mix:
                         loss = mixup_criterion(criterion, out, tgts_a, tgts_b, lam)
@@ -596,7 +604,7 @@ def run_training(base_model: str, task: dict, config: dict, trial_id: int) -> di
             with torch.no_grad():
                 for imgs, tgts in val_loader:
                     imgs, tgts = imgs.to(device), tgts.to(device)
-                    with autocast(device_type="cuda"):
+                    with autocast(device_type="cuda", dtype=_amp_dtype):
                         out = train_model(imgs)
                     val_loss_sum += criterion(out, tgts).item()
                     correct += (out.argmax(1) == tgts).sum().item()
