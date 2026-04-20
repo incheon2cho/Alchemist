@@ -324,6 +324,11 @@ class EMA:
     def update(self, model):
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
+                # NaN guard: a single transient NaN in param.data would
+                # permanently poison the shadow (NaN × decay = NaN forever).
+                # Skip the update for any param that contains non-finite values.
+                if not torch.isfinite(param.data).all():
+                    continue
                 self.shadow[name].mul_(self.decay).add_(param.data, alpha=1 - self.decay)
 
     def apply(self, model):
@@ -579,6 +584,9 @@ def run_training(base_model: str, task: dict, config: dict, trial_id: int) -> di
                 scaler.update()
                 if step_per_batch:
                     scheduler.step()
+                # Update EMA per-batch (standard practice, not per-epoch)
+                if ema:
+                    ema.update(train_model)
                 epoch_loss += loss.item()
 
             if not step_per_batch:
@@ -590,12 +598,9 @@ def run_training(base_model: str, task: dict, config: dict, trial_id: int) -> di
                 logger.warning("  NaN/Inf detected at epoch %d — halting training", epoch + 1)
                 break
 
-            # Update EMA after each epoch
-            if ema:
-                ema.update(train_model)
-
-            # Evaluate (use EMA weights only after warmup period to let shadow stabilize)
-            ema_ready = ema and epoch >= max(warmup_epochs, 10)
+            # EMA is now updated per-batch (above), so shadow is well-trained
+            # by the end of epoch 1. Apply for evaluation after warmup.
+            ema_ready = ema and epoch >= warmup_epochs
             if ema_ready:
                 ema.apply(train_model)
             train_model.eval()
