@@ -1,57 +1,103 @@
 # Alchemist: Vision-Specialized Multi-Agent Framework for Autonomous Model Selection and Self-Refinement
 
-> 논문 초안 — v3 (2026-04-20)
+> 논문 초안 — v4 (2026-04-20)
 
 ---
 
 ## Abstract
 
-대규모 비전 모델 zoo(timm 1,266+, HuggingFace 수만 모델)와 복잡한 학습 레시피(SAM, Mixup, CutMix, EMA, LLRD 등)의 조합 폭발로 인해, 특정 task에 최적인 모델·전략·기법을 찾는 것은 연구자의 주요 병목이다. 기존 AutoML-Agent류 프레임워크는 LLM으로 코드를 생성·실행하지만, (1) 생성 코드의 불안정성(35/35 CUDA 실패), (2) 성능 기반 피드백 부재(에러 수정만 반복), (3) 비전 도메인 고유의 사전학습 corpus 제약·해상도 호환성·전이학습 탐색 공간을 처리하지 못한다.
+대규모 비전 모델 zoo(timm 1,266+, HuggingFace 수만 모델)와 학습 기법의 조합 폭발로 인해, 특정 task에 최적인 모델·기법 조합을 찾는 과정이 실무 연구의 주요 병목이다. 이를 자동화하려면 **(1) 유망 모델의 외부 증거 기반 탐색**, **(2) 추천 모델의 실측 검증**, **(3) SoTA 기법의 자율 적용·개선** 세 단계가 유기적으로 연결되어야 하나, 기존 AutoML-Agent류 프레임워크는 LLM 생성 코드의 불안정성(35/35 CUDA 실패)과 에이전트 간 검증 메커니즘 부재로 이를 달성하지 못한다.
 
-본 논문은 **Alchemist**를 제안한다: **Controller Agent의 7-verb 프로토콜** 하에 Benchmark Agent(3-source retrieval-grounded 모델 탐색)와 Research Agent(SAM·Mixup·EMA 등 22개 SoTA 기법 자율 적용 + cross-task 경험 누적)가 협업하는 비전 특화 다중 에이전트 프레임워크이다.
+본 논문은 **Alchemist**를 제안한다: **Benchmark Agent**(3-source retrieval-grounded 모델 탐색)가 유망 후보를 발굴하고, **Controller Agent**(7-verb 프로토콜)가 실측 검증·실시간 감시·품질 판정으로 파이프라인 신뢰성을 보장하며, **Research Agent**(22개 기법 자율 적용 + cross-task 경험 누적)가 성능을 극대화하는 3-agent 협업 하네스이다. 핵심은 선형 pipeline이 아닌 **validate-fail-fallback 루프**로, 각 단계의 실패가 chain 전체를 중단시키지 않고 자동 대안 탐색으로 이어진다.
 
-CIFAR-100 / Butterfly (75-class) / Shopee-IET (4-class) 3개 데이터셋에서 Alchemist는 AutoML-Agent 대비 2/3 dataset에서 우위를 달성하며 (Butterfly 98.1% vs 96.3%, Shopee 98.8% vs 98.1%), CIFAR-100에서도 SwinV2-Base + SAM 조합으로 94%+ 를 기록하였다. 또한 Controller의 vision-aware early-stop은 R1 compute의 40%+ 를 절감하고, cross-task experience store를 통해 후속 task의 cold-start 수렴이 가속됨을 실증하였다.
+CIFAR-100 / Butterfly / Shopee-IET 3개 데이터셋에서 동일 제약 하에 Alchemist는 AutoML-Agent plan 대비 2/3 dataset 우위(Butterfly 98.1% vs 96.3%, Shopee 98.8% vs 98.1%), CIFAR-100에서 SwinV2-Base + SAM으로 94%+를 달성하였다. Controller의 early-stop은 R1 compute 40%+를 절감하고, cross-task experience로 후속 task cold-start가 가속됨을 실증하였다.
 
 ---
 
 ## 1. Introduction
 
-### 1.1 배경 및 동기
+### 1.1 배경
 
-비전 분야는 다른 AI 도메인과 구별되는 네 가지 구조적 특성을 갖는다:
+비전 모델 최적화는 세 단계의 의사결정이 유기적으로 맞물려야 하는 복합 문제이다: **(1) 어떤 모델을 출발점으로 삼을 것인가** (timm 1,266+개 중 선택), **(2) 그 모델이 주어진 task에 적합한지 어떻게 검증할 것인가** (LLM 추론만으로는 hallucination 위험), **(3) 어떤 기법 조합으로 성능을 극대화할 것인가** (SAM, Mixup, CutMix, EMA, LLRD 등 수십 가지 조합). 기존 연구는 이 세 단계를 개별적으로 다루거나 단일 LLM에 일임하여, 단계 간 정보 단절과 실행 레이어의 silent failure가 발생한다.
 
-**(P1) Pretrain corpus ambiguity.** 동일 아키텍처라도 사전학습 데이터(ImageNet-1K / 21K / JFT-300M / LAION-2B / LVD-142M)에 따라 전이 성능이 5-10%p 차이 나며, 공정 비교를 위한 tier 정의가 비명시적이다.
+AutoML-Agent(ICML 2025)는 LLM 기반 multi-agent로 이를 통합 시도하지만, planning → code generation → execution의 선형 파이프라인에서 **(i) LLM 생성 코드의 런타임 불안정성**(35/35 CUDA 실패), **(ii) 성능 기반 피드백 부재**(에러 수정만 반복), **(iii) 에이전트 간 검증 메커니즘 부재**(추천 모델이 실제로 로드 가능한지, 제안 기법이 실제로 적용됐는지 확인하지 않음)라는 한계를 보인다.
 
-**(P2) Heterogeneous model zoo.** timm에만 1,266개 모델이 등록되어 있으며, 입력 해상도(224/256/384/448/518), 패치 크기(8/14/16/32), 윈도우 크기가 모델마다 다르다. 잘못된 해상도를 입력하면 학습이 즉시 실패한다.
+### 1.2 문제 정의: 세 단계의 자율화
 
-**(P3) Transfer-learning decision space.** freeze/unfreeze × adapter(linear_head/LoRA/none) × LLRD(layer-wise LR decay) × augmentation(Mixup/CutMix/RandAugment/EMA/SAM)의 다차원 조합을 탐색해야 최적 성능에 도달한다. 이 탐색 공간은 NLP의 LoRA/adapter 선택보다 복잡하다.
+본 연구는 모델 탐색 · 검증 · 최적화 세 단계를 **전문화된 에이전트에 분담하고, 에이전트 간 협업 프로토콜로 단절을 해소**하는 접근을 취한다. 각 단계에서 해결해야 할 핵심 과제는:
 
-**(P4) Compute waste on hopeless trials.** 높은 learning rate로 pretrained backbone을 fine-tuning하면 epoch 3 이내에 catastrophic forgetting이 발생하나, 기존 시스템은 full training이 끝날 때까지 이를 감지하지 못한다.
+**(Stage 1 — 탐색) 어떤 모델이 이 task에 가장 유망한가?**
+단일 LLM 추론은 존재하지 않는 모델명을 hallucinate하거나, 제약을 위반하는 모델을 추천할 수 있다. PwC 리더보드 · HuggingFace Hub · arXiv 등 외부 증거에 **grounding된 추천**이 필요하다.
 
-### 1.2 관련 연구의 한계
+**(Stage 2 — 검증) 추천된 모델이 실제로 작동하는가?**
+추천명이 timm의 실제 모델 ID와 불일치하거나(e.g., "Astroformer" → timm 미등록), 입력 해상도가 호환되지 않을 수 있다(SwinV2 256px ≠ 기본 224px). LLM의 symbolic reasoning만으로는 이를 판별할 수 없으며, **실측 baseline 평가**로 교차 검증해야 한다.
 
-**AutoML-Agent (ICML 2025, KAIST/DeepAuto.ai):** LLM 기반 multi-agent로 planning→code generation→execution 파이프라인을 구성하나, (1) LLM 생성 코드의 런타임 불안정성(CUDA assert, 경로 오류, download=True 등), (2) 성능 기반 iteration 부재(n_attempts=5는 코드 에러 수정만, metric-driven refinement 없음), (3) 비전 도메인 지식 미반영(사전학습 corpus 제약, 해상도 호환성, modern training recipe)이라는 한계가 있다.
+**(Stage 3 — 최적화) 어떤 기법을 적용해야 성능이 오르는가?**
+에이전트가 "SAM을 쓰라"고 제안해도 실행 레이어에서 silent drop되면 무의미하다. 기법이 **실제로 적용됐는지 검증**하고, 실패 시 다음 trial을 **자동 조정**하며, 이전 task 경험을 **축적·전이**하는 closed-loop 자기 개선이 필요하다.
 
-**일반 AutoML/NAS:** 아키텍처 탐색 또는 HP 최적화 중 하나에 집중하며, 모델 선정부터 학습 전략·기법 적용·결과 분석·자율 개선까지의 전 과정을 통합하지 못한다.
+### 1.3 제안: Alchemist — 3-Agent 협업 하네스
 
-### 1.3 Alchemist 제안
+Alchemist는 세 단계를 각각 전문화된 에이전트에 배정하고, **Controller Agent의 7-verb 프로토콜**로 에이전트 간 협업을 orchestrate하는 하네스이다.
 
-본 논문은 위 네 가지 비전 고유 난제를 해결하는 **retriever-grounded multi-agent collaboration** 프레임워크를 제안한다. 핵심 설계 원리는:
+#### Benchmark Agent — Retrieval-Grounded 모델 탐색 (Stage 1)
 
-- **Controller 중심 7-verb 프로토콜**: Formalize → Invoke → Scrutinize → Assay → Instantiate → Surveil → Adjudicate — 단순 pipeline이 아닌 validate-fail-fallback 루프
-- **Retriever-grounded reasoning**: LLM 판단을 PwC 리더보드 · timm ImageNet CSV · arXiv 논문으로 교차 검증하여 hallucination 방지
-- **Vision Technique Catalog**: 22개 SoTA 기법을 concrete config override로 매핑하여 LLM의 텍스트 제안을 실행 가능한 코드로 연결
-- **Closed-loop verification**: 제안된 기법이 실제로 학습에 적용됐는지 확인하는 피드백 메커니즘
+단일 LLM 판단이 아닌 **3-source 증거 융합**으로 모델을 추천한다:
+- **HuggingFace Hub**: timm 공식 ImageNet top-1 CSV(1,266모델)에서 실측 성능 기반 랭킹. 모델별 입력 해상도 · 파라미터 수 · 사전학습 소스 메타데이터 추출.
+- **Papers-with-Code**: task-specific 리더보드(e.g., CIFAR-100 top-1 accuracy)에서 실제 SoTA 수치와 사용 기법 수집.
+- **arXiv**: 2023-2025 최신 논문에서 유망 아키텍처·기법 컨텍스트 확보.
+
+세 소스의 증거를 HF-first(실행 가능성 보장) → PwC-second(task 성능 참조) 우선순위로 융합하고, task 제약에 위반되는 후보를 자동 제외한 뒤 **Top-K 후보 리스트**를 Controller에 전달한다. 이를 통해 LLM의 hallucinated 모델명이 downstream으로 전파되는 것을 원천 차단한다.
+
+#### Controller Agent — 7-Verb Empirical Guardian (Stage 2 + 전체 orchestration)
+
+Controller는 단순 relay가 아닌, **검증·개입·판단**의 권한을 가진 중앙 통제자이다:
+
+| Verb | 역할 |
+|------|------|
+| **Formalize** | 자연어 task를 typed 제약으로 구조화 |
+| **Invoke** | Benchmark Agent에 모델 탐색 지시 |
+| **Scrutinize** | 추천 모델의 제약 적합성 · HW 호환성 LLM 검증 |
+| **Assay** | Top-K 후보를 **EC2에서 실측 baseline 평가** → LLM 추론의 empirical 교차 검증으로 Winner 선정 |
+| **Instantiate** | Winner + upstream context를 Research Agent에 위임 |
+| **Surveil** | 매 epoch progress 모니터링 + **4-rule vision-aware early-stop** (catastrophic forgetting / hopeless / divergence / collapse) |
+| **Adjudicate** | 최종 결과의 ship/no-ship 판정 |
+
+핵심 기여는 **Assay와 Surveil**이다. Assay는 Benchmark의 LLM 기반 추천을 **실제 GPU에서 검증**하여, 모델 ID 불일치(Astroformer → timm 미등록)나 해상도 비호환(SwinV2 256px)을 runtime에서 감지한다. Surveil은 Research Agent의 trial을 실시간 감시하여, **hopeless trial을 epoch 3에서 선제 종료**(catastrophic forgetting 감지 → ~60분/trial 절감)함으로써 동일 budget 내 유효 실험 수를 극대화한다.
+
+#### Research Agent — Autonomous Vision Expert (Stage 3)
+
+추천된 모델을 받아 **자율적으로 최고 성능 기법 조합을 탐색**한다:
+
+- **Vision Technique Catalog (22개):** SoTA 기법명을 실행 가능한 config override로 매핑(e.g., "stochastic_depth" → `{drop_path_rate: 0.1}`). LLM의 텍스트 제안과 train_worker 사이의 semantic gap을 해소.
+- **Closed-loop verification:** 매 trial 후 제안된 기법(proposed)과 실제 적용된 기법(applied_techniques)을 비교. Silent drop 즉시 감지.
+- **Within-round adaptive tuning:** 실패 모드별 후속 trial 자동 조정 (catastrophic → lr cap, OOM → batch÷2 with forgiveness rule, collapse → epochs cap).
+- **Cross-task VisionExperienceStore:** winning config · 실패 경험을 persistent memory에 기록 → 후속 task에서 유사 경험 retrieve → cold-start 가속.
+
+#### 하네스의 핵심: Validate-Fail-Fallback 루프
+
+Alchemist의 3-agent 협업은 **선형 파이프라인이 아닌 검증-실패-대안 탐색 루프**로 동작한다:
+
+```
+Benchmark 추천 "Astroformer"
+  → Controller Scrutinize: "timm에 미등록" → FAIL
+  → Controller: leaderboard walk → 다음 후보 "SwinV2-Base" 시도
+  → Controller Assay: EC2 baseline 87.8% → PASS → Winner 확정
+  → Research Agent: SAM trial 실행
+  → Controller Surveil: epoch 3 val=70% → KILL (catastrophic)
+  → Research Adapt: lr cap 적용 → 다음 trial 안정적 수렴
+```
+
+각 단계에서 **실패가 chain 전체를 중단시키지 않고, 자동으로 대안을 탐색**한다. 이것이 AutoML-Agent의 선형 pipeline(plan → codegen → execute → error → retry same code)과의 구조적 차별점이다.
 
 ### 1.4 Contributions
 
-1. **Vision-domain ontology 기반 모델 탐색**: PwC + HF Hub(timm ImageNet top-1 CSV, 1,266모델) + arXiv의 3-source retrieval-grounded 모델 스카우팅과, 6-tier pretrain-source ontology(IN-1K/21K/JFT/LAION/LVD-142M/CLIP)에 의한 제약 자동 필터링을 제안한다.
+1. **3-Agent 협업 하네스와 7-verb 프로토콜**: Benchmark(retrieval-grounded 탐색) → Controller(empirical 검증 + vision-aware 감시) → Research(자율 최적화)의 역할 분담과, validate-fail-fallback 루프에 의한 robust orchestration을 제안한다. Controller의 Assay(top-K 실측 검증)와 Surveil(epoch-level early-stop, 40%+ compute 절감)이 LLM 추론의 한계를 empirical barrier로 보완한다.
 
-2. **Controller Agent의 7-verb empirical guardrail**: *Formalize*에서 자연어 제약을 파싱하고, *Scrutinize*로 추천의 제약 적합성을 검증하며, *Assay*로 top-K 후보의 실측 baseline을 비교하고, *Surveil*로 매 epoch vision-aware early-stop(catastrophic forgetting / hopeless / divergence / collapse 4-rule)을 수행한다. 이를 통해 R1 compute의 40%+ 를 절감하였다.
+2. **Vision Technique Catalog + Closed-loop verification**: 22개 SoTA 비전 기법을 executable config로 매핑하고, 제안-실행 간 일치를 검증하는 피드백 루프를 구축하여 에이전트의 기법 적용 신뢰성을 보장한다.
 
-3. **Research Agent의 자율 개선 루프**: (a) **Vision Technique Catalog**(22개 기법의 config 자동 매핑)와 **closed-loop verification**(제안 vs 실제 적용 교차 검증)으로 진정한 자율 기법 적용을 실현하고, (b) **within-round adaptive tuning**(실패 모드별 config 자동 조정: catastrophic→lr cap, divergence→aug↓, OOM→batch÷2, collapse→epochs cap)과 (c) **cross-task VisionExperienceStore**(persistent JSONL, num_classes+keyword Jaccard 유사도)로 task 간 경험을 축적한다.
+3. **Cross-task experience accumulation + adaptive tuning**: 실패 모드별 within-round config 자동 조정과, task 간 persistent memory 축적으로 에이전트가 점진적으로 비전 전문가로 성장한다.
 
-4. **3개 benchmark에서 AutoML-Agent 대비 실증**: CIFAR-100(SwinV2-Base+SAM → 94%+), Butterfly(98.1%), Shopee(98.8%) 3개 dataset에서 Alchemist가 AutoML-Agent plan 대비 2/3 dataset 우위, CIFAR-100에서도 동등 이상의 성능을 달성하며, Controller early-stop / adaptive tuning / experience transfer 각각의 ablation 효과를 보인다.
+4. **3개 benchmark에서 실증**: 동일 제약 하에 Alchemist의 자율 탐색(SwinV2+SAM 94%+ / Butterfly 98.1% / Shopee 98.8%)이 AutoML-Agent plan 대비 우위 또는 동등 성능을 달성하며, 각 에이전트·하네스 구성요소의 ablation 효과를 보인다.
 
 ---
 
