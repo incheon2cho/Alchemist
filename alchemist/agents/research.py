@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 # Default HP search space
-DEFAULT_LR_CANDIDATES = [1e-4, 3e-4, 1e-3, 3e-3]
+DEFAULT_LR_CANDIDATES = [1e-4, 2e-4, 3e-4, 1e-3, 3e-3]
 DEFAULT_BATCH_SIZES = [16, 32, 64]
 DEFAULT_FREEZE_OPTIONS = [True, False]
 DEFAULT_ADAPTERS = ["none", "linear_head", "lora"]
@@ -530,34 +530,74 @@ class ResearchAgent:
                 if name in base_model:
                     params_m = info["params_m"]
                     break
-            # SAM-only unfreeze grid: skip freeze trials (baseline already
-            # measured separately; freeze consistently 10%+ below unfreeze).
-            # Sweep: lr × rho, all with advanced-tech defaults.
-            sam_rhos = [0.02, 0.05, 0.1]  # conservative / standard / aggressive
-            for lr in DEFAULT_LR_CANDIDATES:
-                for rho in sam_rhos:
-                    configs.append(TrialConfig(
-                        lr=lr,
-                        batch_size=_default_batch(params_m, False),
-                        epochs=20,
-                        weight_decay=0.02,
-                        scheduler="cosine",
-                        augmentation="advanced",
-                        freeze_backbone=False,
-                        adapter="linear_head",
-                        optimizer="sam",
-                        sam_rho=rho,
-                        mixup=True,
-                        mixup_alpha=0.3,
-                        cutmix=True,
-                        cutmix_alpha=0.5,
-                        randaugment=True,
-                        label_smoothing=0.1,
-                        ema=True,
-                        ema_decay=0.9999,
-                        warmup_epochs=2,
-                        backbone_lr_scale=0.7,
-                    ))
+            # R1 grid informed by v019 winning config (94.0% on CIFAR-100):
+            #   SAM(rho=0.05), lr=2e-4, LLRD=0.1, drop_path=0.2, 30ep,
+            #   mlp head, Mixup+CutMix+RandAug, cosine schedule.
+            # We sweep key axes around this anchor + EMA on/off ablation.
+            v019_base = dict(
+                batch_size=_default_batch(params_m, False),
+                weight_decay=0.02,
+                scheduler="cosine",
+                augmentation="advanced",
+                freeze_backbone=False,
+                adapter="linear_head",
+                optimizer="sam",
+                mixup=True, mixup_alpha=0.3,
+                cutmix=True, cutmix_alpha=0.5,
+                randaugment=True, label_smoothing=0.1,
+                warmup_epochs=3,
+            )
+            trials = [
+                # --- v019 exact replica (EMA on) ---
+                {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
+                 "epochs": 30, "ema": True, "ema_decay": 0.9999,
+                 "extra": {"drop_path_rate": 0.2}},
+                # --- v019 exact replica (EMA off) — ablation ---
+                {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
+                 "epochs": 30, "ema": False,
+                 "extra": {"drop_path_rate": 0.2}},
+                # --- rho sweep (LLRD=0.1 fixed, EMA on) ---
+                {**v019_base, "lr": 2e-4, "sam_rho": 0.02, "backbone_lr_scale": 0.1,
+                 "epochs": 30, "ema": True, "ema_decay": 0.9999,
+                 "extra": {"drop_path_rate": 0.2}},
+                {**v019_base, "lr": 2e-4, "sam_rho": 0.1, "backbone_lr_scale": 0.1,
+                 "epochs": 30, "ema": True, "ema_decay": 0.9999,
+                 "extra": {"drop_path_rate": 0.2}},
+                # --- lr sweep (rho=0.05 fixed, EMA on) ---
+                {**v019_base, "lr": 1e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
+                 "epochs": 30, "ema": True, "ema_decay": 0.9999,
+                 "extra": {"drop_path_rate": 0.2}},
+                {**v019_base, "lr": 3e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
+                 "epochs": 30, "ema": True, "ema_decay": 0.9999,
+                 "extra": {"drop_path_rate": 0.2}},
+                # --- LLRD ablation (0.1 vs 0.3 vs 0.7, EMA on) ---
+                {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.3,
+                 "epochs": 30, "ema": True, "ema_decay": 0.9999,
+                 "extra": {"drop_path_rate": 0.2}},
+                {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.7,
+                 "epochs": 30, "ema": True, "ema_decay": 0.9999,
+                 "extra": {"drop_path_rate": 0.2}},
+                # --- drop_path ablation (0.0 vs 0.2 vs 0.3, EMA on) ---
+                {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
+                 "epochs": 30, "ema": True, "ema_decay": 0.9999,
+                 "extra": {"drop_path_rate": 0.0}},
+                {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
+                 "epochs": 30, "ema": True, "ema_decay": 0.9999,
+                 "extra": {"drop_path_rate": 0.3}},
+                # --- EMA decay ablation (0.999 vs 0.9999 vs off) ---
+                {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
+                 "epochs": 30, "ema": True, "ema_decay": 0.999,
+                 "extra": {"drop_path_rate": 0.2}},
+                # --- epochs ablation (20ep EMA on) ---
+                {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
+                 "epochs": 20, "ema": True, "ema_decay": 0.9999,
+                 "extra": {"drop_path_rate": 0.2}},
+            ]
+            for t in trials[:remaining_trials]:
+                configs.append(TrialConfig(**{
+                    k: v for k, v in t.items()
+                    if k in {f.name for f in TrialConfig.__dataclass_fields__.values()}
+                }))
         else:
             # Round 2+: LLM-driven advanced-technique refinement.
             # Use suggest_techniques() to get configs with SAM/Mixup/CutMix/EMA
