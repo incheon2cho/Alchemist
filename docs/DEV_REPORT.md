@@ -1000,6 +1000,195 @@ python export_dashboard.py --output /path/to/dashboard/data/alchemist_v2.json
 
 ---
 
-> **⚠️ 주의사항**: 세션 5~9의 토큰 사용량은 세션 종료 후 일괄 추정한 수치입니다. Claude CLI는 세션별 누적 토큰을 자동 보존하지 않으므로 작업 분량과 평균 메시지 크기 기반 역산입니다. 실제 값과 ±30% 오차 가능성이 있습니다. 향후 세션부터는 세션 시작/종료 시점에 즉시 기록하여 오차를 최소화합니다.
+## 세션 11 — 2026-04-15~04-20 (AutoML-Agent 비교 실험 + Alchemist 고도화)
+
+### 개요
+
+| 항목 | 값 |
+|------|-----|
+| 작업 기간 | 04-15 ~ 04-20 (6일) |
+| 변경/생성 파일 | 24+ 파일 |
+| 추가된 코드 | ~4,200줄 |
+| Claude CLI 세션 | 1d5156ae (장기 세션, 8,620 messages) |
+| EC2 인스턴스 | g5.2xlarge (A10G 24GB), 76.6h 사용, $62.73 |
+
+### 토큰 사용량 (실측)
+
+| 구분 | 값 |
+|------|------|
+| Input 토큰 | 15,147 |
+| Output 토큰 | 2,608,117 |
+| Cache read 토큰 | 1,896,438,953 |
+| Cache create 토큰 | 40,014,444 |
+| 메시지 수 | 8,620 |
+
+### EC2 비용 (g5.2xlarge, 세션 11 전용)
+
+| 날짜 | 비용 | GPU 시간 |
+|------|------|---------|
+| 04-14 | $6.04 | 8.7h |
+| 04-15 | $19.15 | 22.6h |
+| 04-16 | $23.00 | 24.0h |
+| 04-17 | $14.54 | 21.3h |
+| **합계** | **$62.73** | **76.6h** |
+
+### 주요 개발 내용
+
+#### 1. AutoML-Agent (ICML 2025) 비교 실험
+- Claude CLI proxy 구축 (OpenAI-compatible endpoint → Claude subprocess)
+- `remote_execute_ec2.py`: SSH + scp 기반 원격 실행 (4-site monkey-patch)
+- 35/35 execute_script CUDA assert 실패 → LLM 생성 코드 불안정 확인
+- **Hybrid 솔루션 도출**: AutoML-Agent plan + Alchemist nas_worker 안정 실행
+
+#### 2. Hybrid (AutoML-Agent plan) 실험 결과
+
+| Dataset | Backbone | Score | Time |
+|---------|----------|-------|------|
+| CIFAR-100 (1K) | convnext_base.fb_in1k | 91.68% | 3h 26m |
+| Butterfly (1K) | convnext_small.fb_in1k | 90.93% | 27m |
+| Shopee-IET (1K) | convnext_base.fb_in1k | 87.50% | 3.3m |
+
+21K 허용 재실험:
+
+| Dataset | Backbone | Score | Time |
+|---------|----------|-------|------|
+| CIFAR-100 (21K) | convnext_base.fb_in22k_ft_in1k | 93.95% | 5h 48m |
+| Butterfly (21K) | convnext_small.fb_in22k_ft_in1k | 96.27% | 27m |
+| Shopee-IET (21K) | convnext_base.fb_in22k_ft_in1k | 98.12% | 3m |
+
+#### 3. Alchemist 3-Agent 고도화
+
+**Benchmark Agent 재설계:**
+- PwC + HF Hub (timm ImageNet top-1 CSV 1266모델) + arXiv 3-source retrieval
+- 6-tier pretrain-source ontology (IN-1K/21K/JFT/LAION/LVD-142M/CLIP)
+- HF-first → PwC-second ranking + constraint filter
+- top-K candidates 리스트 → Controller에 전달
+
+**Controller Agent 6-verb Guardian:**
+- Formalize → Invoke → Scrutinize → Assay → Instantiate → Surveil → Adjudicate
+- Vision-aware mid-trial early-stop (4-rule: catastrophic/hopeless/divergence/plateau)
+- Top-K empirical baseline evaluation → Winner selection
+
+**Research Agent — Adaptive Expert:**
+- R1: Transfer-learning 4-dim grid (freeze × adapter × LLRD × advanced-tech)
+- Advanced vision recipe prior (Mixup α=0.8 + CutMix α=1.0 + RandAug + EMA 0.9999 + LLRD 0.7)
+- `_adapt_config_from_failures`: catastrophic→lr cap, divergence→aug↓, OOM→batch÷2, collapse→epochs cap
+- `suggest_techniques` (R2): LLM 기반 SAM/longer training 제안 → typed TrialConfig 20 필드로 전달
+- `VisionExperienceStore`: cross-task persistent memory (JSONL), 유사 task retrieve
+
+**SSH 안정화:**
+- `subprocess.Popen(DEVNULL)` fire-and-forget submit (SSH hang 근본 해결)
+- Per-epoch `progress.json` writing by train_worker → Controller early-stop polling
+
+**train_worker 안정성:**
+- Warmup 자동 스케일링 (epochs의 10% 이상)
+- LR floor (max(1e-7, lr×0.01)) — near-zero decay 방지
+- NaN/Inf 즉시 감지 + training halt
+
+#### 4. Alchemist 자율 탐색 결과 (21K 허용)
+
+| Dataset | Model | Baseline | Best | Improvement | Trials |
+|---------|-------|----------|------|-------------|--------|
+| CIFAR-100 | convnextv2_base.fcmae_ft_in22k_in1k | 87.0% | **93.8%** | +6.8%p | 19 |
+| Butterfly | convnextv2_base.fcmae_ft_in22k_in1k | 95.7% | **98.1%** | +2.4%p | 17 |
+| Shopee-IET | convnextv2_base.fcmae_ft_in22k_in1k | 97.5% | **98.8%** | +1.2%p | 16 |
+
+#### 5. 최종 비교 (21K 허용, 3 Dataset)
+
+| Dataset | Hybrid (AutoML-Agent plan) | Alchemist (자율) | 차이 |
+|---------|---------------------------|------------------|------|
+| **CIFAR-100** | **93.95%** | 93.80% | Hybrid +0.15%p |
+| **Butterfly** | 96.27% | **98.10%** | Alchemist **+1.83%p** |
+| **Shopee-IET** | 98.12% | **98.80%** | Alchemist **+0.68%p** |
+
+**Alchemist가 3개 중 2개 dataset에서 우위.** CIFAR-100은 R2/R3의 장기 학습 붕괴(epoch 10 이후 val 1%로 collapse)로 개선 실패 → 수정 후 재실험 진행 중.
+
+#### 6. R2 실패 원인 분석 및 수정
+
+**문제:** R2/R3 unfreeze trials (30-60 epochs)에서 epoch 10 이후 val accuracy가 갑자기 1%로 붕괴.
+
+| 원인 | 설명 |
+|------|------|
+| Warmup 비율 부족 | warmup=2 / epochs=30 = 6.7% (너무 짧음) |
+| Cosine LR floor 없음 | LR → 0.0 수렴 → 수치 불안정 → NaN |
+| Batch=32 gradient noise | OOM adapt로 64→32 축소된 상태에서 장기 학습 |
+
+**수정:** train_worker warmup 자동 스케일링 + LR floor + NaN 감지 / Research Agent collapse 실패 모드 감지 + epochs cap + batch 하한 64 / Experience store에 "장기 학습 주의" 경고 기록
+
+#### 7. 기능 실증 로그
+
+**Controller early-stop 실증 (CIFAR R1):**
+```
+Trial 6: lr=1e-3 unfreeze → epoch 3: val=70.7% < baseline-10%p → KILL (120분 절감)
+Trial 8: lr=1e-3 unfreeze → epoch 3: val=69.1% < baseline-10%p → KILL (120분 절감)
+```
+
+**Adaptive tuning 실증:**
+```
+Trial 1 OOM → [adapt] batch_size 64 → 32
+Trial 6 catastrophic → 이후 unfreeze trial lr cap 적용
+```
+
+**Experience store 실증:**
+```
+CIFAR-100 재실행 시: "Experience retrieved: 3 prior similar tasks" 로그 확인
+```
+
+### 산출물 목록
+
+| 파일 | 내용 |
+|------|------|
+| `alchemist/core/experience_store.py` | Cross-task persistent memory (신규) |
+| `alchemist/core/retrievers/{hf_hub,arxiv}.py` | PwC + HF + arXiv retriever (신규) |
+| `alchemist/agents/benchmark.py` | 3-source scout + HF-first ranking (대폭 수정) |
+| `alchemist/agents/controller.py` | evaluate_trial_progress 4-rule early-stop (신규) |
+| `alchemist/agents/research.py` | Adaptive tuning + experience + advanced tech R1 (대폭 수정) |
+| `alchemist/core/executor.py` | SSH Popen + early-stop polling + kill (수정) |
+| `alchemist/core/schemas.py` | TrialConfig 20-field + Leaderboard candidates (수정) |
+| `alchemist/harness.py` | Top-K baseline eval + Controller wire-up (수정) |
+| `train_worker.py` | Warmup auto-scale + LR floor + NaN detect + progress.json (수정) |
+| `baselines/*.py, *.sh` | AutoML-Agent + Hybrid + Alchemist launchers (13 files, 신규) |
+| `docs/PAPER_OUTLINE.md` | 논문 outline v2 (대폭 수정) |
+| `docs/FIGURE_PROMPT.md` | Nano Banana 프롬프트 v1-v4 (신규+수정) |
+| `docs/FIGURE_CAPTIONS.md` | Figure 1 캡션 한영 6종 (신규) |
+
+### Git commits (세션 11)
+
+| Hash | 메시지 |
+|------|--------|
+| 31e6d3f | feat: 21K-allowed Benchmark Agent + top-K research pipeline + baselines |
+| 12999ce | fix: SSH Popen fire-and-forget + update figure prompt |
+| 5fc8040 | feat: Controller early-stop + Research adaptive tuning + cross-task experience |
+| 3cec9c3 | feat: OOM 'forgiveness' rule in adaptive tuning |
+| 78640a6 | docs: add FIGURE_CAPTIONS.md |
+| fc947a2 | fix: Research Agent auto-detects mid-training collapse + train_worker stabilization |
+
+---
+
+## 📊 세션 1~11 총 누적
+
+| 항목 | 값 |
+|---|---|
+| **총 Input 토큰** | ~1,015,000+ |
+| **총 Output 토큰** | ~3,078,000+ |
+| **총 AWS 비용** | **~$323** (세션 1~10 ~$260 + 세션 11 ~$63) |
+| **Best Score (CIFAR-100)** | Hybrid 93.95% / Alchemist 93.8% (R2 재실험 진행 중) |
+| **Best Score (Butterfly)** | Alchemist **98.1%** |
+| **Best Score (Shopee-IET)** | Alchemist **98.8%** |
+
+### 성능 진화 추적 (업데이트)
+
+| 세션 | Best Model | CIFAR-100 | 대비 |
+|------|-----------|-----------|------|
+| 세션 3 | ResNet-50 + OneCycleLR | 86.77% | baseline |
+| 세션 4 | ConvNeXt-Tiny + MLP | 90.87% | +4.1%p |
+| 세션 6 | Swin-Base + SAM | 94.00% | +7.2%p |
+| **세션 11 Hybrid** | ConvNeXt-Base (21K) + AutoML-Agent plan | **93.95%** | +7.2%p |
+| **세션 11 Alchemist** | ConvNeXtV2-Base (22K+1K) + 자율 탐색 | **93.80%** | +7.0%p |
+| 세션 11 Alchemist R2 | (재실험 진행 중, 목표 94%+) | — | — |
+
+---
+
+> **⚠️ 주의사항**: 세션 5~9의 토큰 사용량은 세션 종료 후 일괄 추정한 수치입니다. 세션 11의 토큰 사용량은 Claude CLI 세션 JSONL에서 직접 추출한 실측값입니다.
 
 *이후 개발 내역은 이 문서에 세션별로 추가됩니다.*
