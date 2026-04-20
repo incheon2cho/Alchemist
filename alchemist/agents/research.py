@@ -473,10 +473,10 @@ class ResearchAgent:
             # 50–100M get 64 (safer margin for activations+optimizer states).
             def _default_batch(params_m: float, freeze: bool) -> int:
                 if freeze:
-                    return 256  # linear probe / no grad on backbone
+                    return 128  # linear probe / no grad on backbone
                 if params_m >= 50:
-                    return 64
-                return 128
+                    return 32   # large model + EMA + Mixup/CutMix = ~20GB at batch 32
+                return 64
             params_m = 0.0
             for name, info in [
                 ("dinov2_vitb14", {"params_m": 86}),
@@ -501,7 +501,7 @@ class ResearchAgent:
                         configs.append(TrialConfig(
                             lr=lr,
                             batch_size=_default_batch(params_m, freeze),
-                            epochs=10,
+                            epochs=20 if advanced else 5,
                             weight_decay=0.05 if advanced else 0.01,
                             scheduler="cosine",
                             augmentation="advanced" if advanced else "basic",
