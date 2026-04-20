@@ -462,6 +462,7 @@ def run_training(base_model: str, task: dict, config: dict, trial_id: int) -> di
     label_smoothing = config.get("label_smoothing", 0.0)
     warmup_epochs = config.get("warmup_epochs", 0)
     backbone_lr_scale = config.get("backbone_lr_scale", 1.0)
+    ema = None  # set in unfreeze branch; None for freeze path
 
     freeze = config.get("freeze_backbone", True)
     lr = config.get("lr", 1e-3)
