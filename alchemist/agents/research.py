@@ -48,6 +48,42 @@ DEFAULT_BATCH_SIZES = [16, 32, 64]
 DEFAULT_FREEZE_OPTIONS = [True, False]
 DEFAULT_ADAPTERS = ["none", "linear_head", "lora"]
 
+# ---------------------------------------------------------------------------
+# Vision Technique Catalog — maps SoTA technique names to concrete config
+# overrides that train_worker.py understands. Used by suggest_techniques()
+# to bridge the gap between "LLM knows the technique name" and "executor
+# needs a typed config dict".
+# ---------------------------------------------------------------------------
+VISION_TECHNIQUE_CATALOG: dict[str, dict] = {
+    # --- Optimizers ---
+    "sam":                  {"optimizer": "sam", "sam_rho": 0.05},
+    "sam_conservative":     {"optimizer": "sam", "sam_rho": 0.02},
+    "sam_aggressive":       {"optimizer": "sam", "sam_rho": 0.1},
+    # --- Augmentation ---
+    "mixup_light":          {"mixup": True, "mixup_alpha": 0.2},
+    "mixup_standard":       {"mixup": True, "mixup_alpha": 0.8},
+    "cutmix":               {"cutmix": True, "cutmix_alpha": 1.0},
+    "cutmix_light":         {"cutmix": True, "cutmix_alpha": 0.5},
+    "randaugment":          {"randaugment": True},
+    "random_erasing":       {"extra": {"random_erasing": True, "random_erasing_prob": 0.25}},
+    # --- Regularization ---
+    "stochastic_depth":     {"extra": {"drop_path_rate": 0.1}},
+    "stochastic_depth_strong": {"extra": {"drop_path_rate": 0.3}},
+    "label_smoothing":      {"label_smoothing": 0.1},
+    "ema":                  {"ema": True, "ema_decay": 0.9999},
+    "llrd":                 {"backbone_lr_scale": 0.7},
+    "weight_decay_light":   {"weight_decay": 0.01},
+    "weight_decay_heavy":   {"weight_decay": 0.05},
+    # --- Schedule ---
+    "cosine_restarts":      {"extra": {"lr_schedule": "cosine_restarts"}},
+    "onecycle":             {"extra": {"lr_schedule": "onecycle"}},
+    "longer_training_30ep": {"epochs": 30, "warmup_epochs": 3},
+    "longer_training_50ep": {"epochs": 50, "warmup_epochs": 5},
+    # --- Architecture ---
+    "se_attention":         {"extra": {"add_se": True}},
+    "cbam_attention":       {"extra": {"add_attention": True}},
+}
+
 
 class ResearchLog:
     """Research Agent의 전체 연구 과정을 기록하는 로그.
@@ -770,40 +806,99 @@ class ResearchAgent:
         sota_knowledge: str,
         analysis_history: list[str],
     ) -> list[dict[str, Any]]:
-        """LLM suggests new techniques to try based on SoTA gap analysis.
+        """Suggest new technique configs based on SoTA gap + catalog.
 
-        Returns list of technique configs that can be applied to experiment design.
+        Two-path approach:
+          1. **Catalog-driven** (deterministic): identify untried techniques
+             from VISION_TECHNIQUE_CATALOG and compose configs.
+          2. **LLM-driven** (creative): ask LLM for novel combinations with
+             available catalog technique names as a menu.
+
+        Returns list of config dicts ready for TrialConfig parsing.
         """
-        history_summary = "\n---\n".join(analysis_history[-3:]) if analysis_history else "None"
+        # 1. Identify which catalog techniques were already tried
+        tried_techniques = set()
+        if analysis_history:
+            combined = " ".join(analysis_history)
+            for tech_name in VISION_TECHNIQUE_CATALOG:
+                if tech_name.lower() in combined.lower():
+                    tried_techniques.add(tech_name)
 
+        # Untried techniques from catalog
+        untried = {k: v for k, v in VISION_TECHNIQUE_CATALOG.items()
+                   if k not in tried_techniques}
+        logger.info(
+            "Technique catalog: %d total, %d tried, %d untried",
+            len(VISION_TECHNIQUE_CATALOG), len(tried_techniques), len(untried),
+        )
+
+        # 2. Compose concrete configs from untried techniques
+        # Strategy: take the best-performing base config (lr=1e-4 or 3e-4,
+        # unfreeze, batch=32) and layer untried techniques on top.
+        base_config = {
+            "lr": 1e-4, "batch_size": 32, "epochs": 20,
+            "freeze_backbone": False, "adapter": "linear_head",
+            "optimizer": "sam", "sam_rho": 0.05,
+            "mixup": True, "mixup_alpha": 0.3,
+            "cutmix": True, "cutmix_alpha": 0.5,
+            "randaugment": True, "label_smoothing": 0.1,
+            "ema": True, "ema_decay": 0.9999,
+            "warmup_epochs": 2, "backbone_lr_scale": 0.7,
+            "weight_decay": 0.02,
+        }
+
+        configs = []
+
+        # Priority untried techniques (ordered by expected impact)
+        priority_techs = [
+            "stochastic_depth", "random_erasing", "sam_aggressive",
+            "cosine_restarts", "longer_training_30ep",
+            "stochastic_depth_strong", "se_attention",
+        ]
+        for tech_name in priority_techs:
+            if tech_name in untried and len(configs) < 5:
+                cfg = {**base_config}
+                overrides = untried[tech_name]
+                # Merge overrides (handle nested "extra" dict)
+                extra = cfg.pop("extra", {})
+                tech_extra = overrides.pop("extra", {}) if "extra" in overrides else {}
+                cfg.update(overrides)
+                cfg["extra"] = {**extra, **tech_extra}
+                cfg["_technique"] = tech_name  # tag for logging
+                configs.append(cfg)
+                logger.info("[catalog] proposing untried technique: %s", tech_name)
+
+        # 3. LLM-driven creative suggestions (with catalog as menu)
+        catalog_menu = ", ".join(sorted(untried.keys()))
+        history_summary = "\n---\n".join(analysis_history[-2:]) if analysis_history else "None"
         prompt = (
-            f"Based on the SoTA analysis and experiment history, suggest 3-5 specific "
-            f"new configurations to try.\n\n"
-            f"Task: {task.name}, current best: {current_best:.2f}%\n\n"
-            f"SoTA knowledge:\n{sota_knowledge[:500]}\n\n"
+            f"You are a Research Agent. Suggest 2-3 NEW experiment configs.\n\n"
+            f"Task: {task.name}, current best: {current_best:.2f}%\n"
+            f"Available untried techniques: {catalog_menu}\n\n"
             f"Recent analysis:\n{history_summary[:500]}\n\n"
-            f"Return ONLY a JSON array of config objects. Each must have:\n"
-            f"lr (float), batch_size (int), epochs (int), freeze_backbone (bool), "
-            f"adapter (string), optimizer (string: 'adamw'/'sam'/'sgd'), "
-            f"scheduler (string), mixup (bool), cutmix (bool), "
-            f"extra_technique (string: description of any new technique)\n\n"
-            f"Focus on techniques NOT yet tried. Be creative but practical."
+            f"Return ONLY a JSON array. Each config: lr, batch_size, epochs, "
+            f"freeze_backbone, adapter, optimizer ('sam'/'adamw'), sam_rho, "
+            f"mixup, cutmix, techniques (list of technique names from above).\n"
+            f"Focus on COMBINATIONS of untried techniques."
         )
-        result = safe_llm_call(
-            self.llm, prompt,
-            fallback=[
-                {"lr": 0.0003, "batch_size": 64, "epochs": 50, "freeze_backbone": False,
-                 "adapter": "mlp", "optimizer": "sam", "scheduler": "cosine",
-                 "mixup": True, "cutmix": True, "extra_technique": "SAM optimizer"},
-                {"lr": 0.0001, "batch_size": 32, "epochs": 80, "freeze_backbone": False,
-                 "adapter": "mlp", "optimizer": "adamw", "scheduler": "cosine",
-                 "mixup": True, "cutmix": True, "extra_technique": "longer training + lower LR"},
-            ],
-        )
-        if isinstance(result, list):
-            logger.info("LLM suggested %d new techniques", len(result))
-            return result
-        return []
+        llm_configs = safe_llm_call(self.llm, prompt, fallback=[])
+        if isinstance(llm_configs, list):
+            for cfg in llm_configs[:3]:
+                if isinstance(cfg, dict):
+                    # Apply catalog overrides for any named techniques
+                    for tech_name in cfg.get("techniques", []):
+                        if tech_name in VISION_TECHNIQUE_CATALOG:
+                            overrides = VISION_TECHNIQUE_CATALOG[tech_name].copy()
+                            extra = overrides.pop("extra", {})
+                            cfg.update(overrides)
+                            cfg.setdefault("extra", {}).update(extra)
+                    configs.append(cfg)
+
+        logger.info("suggest_techniques: %d configs (%d catalog + %d LLM)",
+                    len(configs),
+                    sum(1 for c in configs if "_technique" in c),
+                    sum(1 for c in configs if "_technique" not in c))
+        return configs
 
     # ------------------------------------------------------------------
     # Self-Analysis
