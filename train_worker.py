@@ -338,6 +338,7 @@ class SAM(torch.optim.Optimizer):
         self.rho = rho
         self.param_groups = base_optimizer.param_groups
         self.state = base_optimizer.state
+        self._sam_state = {}  # SAM's own state, separate from base optimizer
 
     @torch.no_grad()
     def first_step(self):
@@ -350,17 +351,17 @@ class SAM(torch.optim.Optimizer):
                     continue
                 e_w = p.grad * scale
                 p.add_(e_w)  # climb to the worst point
-                self.state.setdefault(p, {})["e_w"] = e_w
+                self._sam_state[p] = e_w  # store in SAM's own state
 
     @torch.no_grad()
     def second_step(self):
         """Descend from the perturbed point using base optimizer."""
         for group in self.param_groups:
             for p in group["params"]:
-                if p.grad is None:
-                    continue
-                p.sub_(self.state[p]["e_w"])  # restore to original
+                if p in self._sam_state:
+                    p.sub_(self._sam_state[p])  # restore to original
         self.base_optimizer.step()
+        self._sam_state.clear()
 
     def zero_grad(self, *args, **kwargs):
         self.base_optimizer.zero_grad(*args, **kwargs)
