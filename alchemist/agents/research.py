@@ -79,9 +79,13 @@ VISION_TECHNIQUE_CATALOG: dict[str, dict] = {
     "onecycle":             {"extra": {"lr_schedule": "onecycle"}},
     "longer_training_30ep": {"epochs": 30, "warmup_epochs": 3},
     "longer_training_50ep": {"epochs": 50, "warmup_epochs": 5},
-    # --- Architecture ---
+    # --- Architecture (universal — works on any timm model) ---
     "se_attention":         {"extra": {"add_se": True}},
-    "cbam_attention":       {"extra": {"add_attention": True}},
+    "cbam_attention":       {"extra": {"add_cbam": True}},
+    "self_attention_2d":    {"extra": {"add_self_attention": True, "self_attn_heads": 4}},
+    "lora_attn":            {"extra": {"add_lora": True, "lora_rank": 8, "lora_targets": "attn"}},
+    "lora_qkv":             {"extra": {"add_lora": True, "lora_rank": 4, "lora_targets": "qkv"}},
+    "adapter_houlsby":      {"extra": {"add_adapter": True, "adapter_bottleneck": 64}},
 }
 
 

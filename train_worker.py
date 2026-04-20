@@ -210,12 +210,17 @@ def build_model(base_model: str, num_classes: int, config: dict, device):
             drop_rate=drop_rate, drop_path_rate=drop_path,
         )
 
-        # Apply architecture modifications (SE, attention, head replacement)
-        is_resnet = "resnet" in base_model.lower()
-        if is_resnet:
-            model = modify_resnet_architecture(model, config, num_classes)
-            logger.info("  Architecture mods: SE=%s, Attn=%s, Head=%s",
-                        config.get("add_se"), config.get("add_attention"), adapter)
+        # Apply architecture modifications — universal (works on any timm model)
+        try:
+            from alchemist.core.arch_modifier import apply_arch_modifications
+            model = apply_arch_modifications(model, config)
+        except ImportError:
+            # Fallback to legacy ResNet-only modifier
+            is_resnet = "resnet" in base_model.lower()
+            if is_resnet:
+                model = modify_resnet_architecture(model, config, num_classes)
+                logger.info("  Architecture mods (legacy): SE=%s, Attn=%s",
+                            config.get("add_se"), config.get("add_attention"))
 
         model = model.to(device)
         embed_dim = num_classes
