@@ -15,6 +15,9 @@ import sys
 import time
 from pathlib import Path
 
+import torch
+import torch.nn as nn
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -226,7 +229,19 @@ def build_loaders(task: dict, config: dict):
     from torch.utils.data import DataLoader
     from torchvision.datasets import ImageFolder
 
-    img_size = config.get("img_size", 224)
+    # Auto-detect model's native img_size from timm if not specified.
+    # This prevents mismatch errors (e.g., SwinV2_256 expects 256px, not 224).
+    img_size = config.get("img_size")
+    if img_size is None or img_size == 0:
+        try:
+            import timm
+            _data_cfg = timm.data.resolve_model_data_config(
+                timm.create_model(config.get("_base_model", ""), pretrained=False)
+            )
+            img_size = _data_cfg.get("input_size", (3, 224, 224))[-1]
+            logger.info("  Auto-detected img_size: %d", img_size)
+        except Exception:
+            img_size = 224
     bs = config.get("batch_size", 128)
     use_randaug = config.get("randaugment", False)
     use_erasing = config.get("random_erasing", False)
@@ -453,6 +468,7 @@ def run_training(base_model: str, task: dict, config: dict, trial_id: int) -> di
     ema_decay = config.get("ema_decay", 0.999)
 
     model, head, embed_dim = build_model(base_model, num_classes, config, device)
+    config["_base_model"] = base_model  # for img_size auto-detection in build_loaders
     train_loader, val_loader = build_loaders(task, config)
 
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
