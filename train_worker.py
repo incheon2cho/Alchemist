@@ -453,6 +453,16 @@ def run_training(base_model: str, task: dict, config: dict, trial_id: int) -> di
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_classes = task.get("num_classes", 100)
 
+    # Default values for applied_techniques (overridden in unfreeze branch)
+    opt_name = config.get("optimizer", "adamw").lower()
+    sam_rho = config.get("sam_rho", 0.05)
+    use_mixup = config.get("mixup", False)
+    use_cutmix = config.get("cutmix", False)
+    use_randaug = config.get("randaugment", False)
+    label_smoothing = config.get("label_smoothing", 0.0)
+    warmup_epochs = config.get("warmup_epochs", 0)
+    backbone_lr_scale = config.get("backbone_lr_scale", 1.0)
+
     freeze = config.get("freeze_backbone", True)
     lr = config.get("lr", 1e-3)
     epochs = config.get("epochs", 30)
