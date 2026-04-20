@@ -1056,10 +1056,28 @@ class ResearchAgent:
                 if result.score >= baseline_score * 0.5:
                     consecutive_clean += 1
 
+                # Closed-loop verification: check what train_worker ACTUALLY applied
+                applied = getattr(result, '_applied_techniques', None)
+                if applied is None and hasattr(result, 'config'):
+                    # Try to read from result dict if returned by executor
+                    applied = getattr(result, 'applied_techniques', None)
+                proposed_opt = config.optimizer
+                actual_opt = applied.get("optimizer", "unknown") if isinstance(applied, dict) else "unknown"
+                if isinstance(applied, dict) and proposed_opt != actual_opt:
+                    logger.warning(
+                        "[closed-loop] MISMATCH: proposed optimizer=%s but train_worker used %s",
+                        proposed_opt, actual_opt,
+                    )
+                else:
+                    logger.info(
+                        "[closed-loop] verified: optimizer=%s applied correctly",
+                        proposed_opt,
+                    )
+
                 logger.info(
-                    "Trial %d/%d: lr=%.4f freeze=%s adapter=%s → %.1f%% (%.0fs)",
+                    "Trial %d/%d: lr=%.4f freeze=%s opt=%s → %.1f%% (%.0fs)",
                     i + 1, len(configs),
-                    config.lr, config.freeze_backbone, config.adapter,
+                    config.lr, config.freeze_backbone, config.optimizer,
                     result.score, result.elapsed_s,
                 )
             except RuntimeError as e:

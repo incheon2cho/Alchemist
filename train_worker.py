@@ -762,6 +762,20 @@ def run_training(base_model: str, task: dict, config: dict, trial_id: int) -> di
     ckpt_path = ckpt_dir / f"{task['name']}_{base_model.replace('.', '_')}_trial{trial_id}.pt"
     torch.save(ckpt_state, ckpt_path)
 
+    # Record ACTUALLY-APPLIED techniques for closed-loop feedback.
+    # Research Agent can verify what train_worker really used (vs what was proposed).
+    applied_techniques = {
+        "optimizer": opt_name,
+        "precision": "bf16" if _use_bf16 else "fp16",
+        "ema": bool(ema),
+        "mixup": bool(use_mixup),
+        "cutmix": bool(use_cutmix),
+        "randaugment": bool(use_randaug),
+        "label_smoothing": float(label_smoothing),
+        "sam_rho": float(sam_rho) if opt_name == "sam" else None,
+        "backbone_lr_scale": float(backbone_lr_scale),
+        "warmup_epochs": int(warmup_epochs),
+    }
     return {
         "status": "ok",
         "trial_id": trial_id,
@@ -771,6 +785,7 @@ def run_training(base_model: str, task: dict, config: dict, trial_id: int) -> di
         "elapsed_s": round(elapsed, 1),
         "config": config,
         "checkpoint_path": str(ckpt_path),
+        "applied_techniques": applied_techniques,
     }
 
 
