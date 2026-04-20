@@ -310,6 +310,63 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
+class SAM(torch.optim.Optimizer):
+    """Sharpness-Aware Minimization (Foret et al., ICLR 2021).
+
+    Wraps a base optimizer. Each step performs two forward/backward passes:
+    1. Ascend: perturb weights in the gradient direction (to find sharp point)
+    2. Descend: compute gradients at the perturbed point and step normally
+    """
+
+    def __init__(self, base_optimizer, rho=0.05):
+        self.base_optimizer = base_optimizer
+        self.rho = rho
+        self.param_groups = base_optimizer.param_groups
+        self.state = base_optimizer.state
+
+    @torch.no_grad()
+    def first_step(self):
+        """Ascend to the worst point in the rho-neighborhood."""
+        grad_norm = self._grad_norm()
+        scale = self.rho / (grad_norm + 1e-12)
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                e_w = p.grad * scale
+                p.add_(e_w)  # climb to the worst point
+                self.state.setdefault(p, {})["e_w"] = e_w
+
+    @torch.no_grad()
+    def second_step(self):
+        """Descend from the perturbed point using base optimizer."""
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                p.sub_(self.state[p]["e_w"])  # restore to original
+        self.base_optimizer.step()
+
+    def zero_grad(self, *args, **kwargs):
+        self.base_optimizer.zero_grad(*args, **kwargs)
+
+    def step(self, closure=None):
+        """Standard step (for non-SAM-aware callers). Uses single step."""
+        self.base_optimizer.step(closure)
+
+    @torch.no_grad()
+    def _grad_norm(self):
+        norm = torch.norm(
+            torch.stack([
+                p.grad.detach().norm(2)
+                for group in self.param_groups
+                for p in group["params"]
+                if p.grad is not None
+            ])
+        )
+        return norm
+
+
 class EMA:
     """Exponential Moving Average of model parameters."""
 
@@ -482,7 +539,21 @@ def run_training(base_model: str, task: dict, config: dict, trial_id: int) -> di
         else:
             param_groups = [{"params": train_model.parameters(), "lr": lr}]
 
-        optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+        # Optimizer selection: AdamW (default) / SGD / SAM
+        opt_name = config.get("optimizer", "adamw").lower()
+        if opt_name == "sam":
+            base_optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+            sam_rho = config.get("sam_rho", 0.05)
+            optimizer = SAM(base_optimizer, rho=sam_rho)
+            logger.info("  Optimizer: SAM(AdamW, rho=%.3f)", sam_rho)
+        elif opt_name == "sgd":
+            optimizer = torch.optim.SGD(
+                param_groups, momentum=0.9, weight_decay=weight_decay,
+            )
+            logger.info("  Optimizer: SGD(momentum=0.9)")
+        else:
+            optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+            logger.info("  Optimizer: AdamW")
 
         # LR Scheduling strategy
         lr_strategy = config.get("lr_schedule", "warmup_cosine")
@@ -576,14 +647,44 @@ def run_training(base_model: str, task: dict, config: dict, trial_id: int) -> di
                     else:
                         loss = criterion(out, tgts)
 
-                optimizer.zero_grad()
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(train_model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                _is_sam = isinstance(optimizer, SAM)
+                if _is_sam:
+                    # SAM two-step: (1) ascend, (2) descend
+                    # Step 1: compute gradient at current point
+                    optimizer.zero_grad()
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer.base_optimizer)
+                    nn.utils.clip_grad_norm_(train_model.parameters(), 1.0)
+                    optimizer.first_step()  # perturb weights
+                    scaler.update()
+
+                    # Step 2: compute gradient at perturbed point
+                    with autocast(device_type="cuda", dtype=_amp_dtype):
+                        out2 = train_model(imgs)
+                        if apply_mix:
+                            loss2 = mixup_criterion(criterion, out2, tgts_a, tgts_b, lam)
+                        else:
+                            loss2 = criterion(out2, tgts)
+                    optimizer.zero_grad()
+                    scaler.scale(loss2).backward()
+                    scaler.unscale_(optimizer.base_optimizer)
+                    nn.utils.clip_grad_norm_(train_model.parameters(), 1.0)
+                    optimizer.second_step()  # restore + base_optimizer.step
+                    scaler.update()
+                else:
+                    # Standard single-step
+                    optimizer.zero_grad()
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(train_model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+
                 if step_per_batch:
-                    scheduler.step()
+                    if _is_sam:
+                        scheduler.step()
+                    else:
+                        scheduler.step()
                 # Update EMA per-batch (standard practice, not per-epoch)
                 if ema:
                     ema.update(train_model)

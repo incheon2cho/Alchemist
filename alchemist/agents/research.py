@@ -492,11 +492,11 @@ class ResearchAgent:
                     break
             for lr in DEFAULT_LR_CANDIDATES:
                 for freeze in freeze_options:
-                    for adapter in ["linear_head", "none"]:
+                    for opt in (["adamw", "sam"] if not freeze else ["adamw"]):
                         # Unfreeze trials get advanced-technique defaults
                         # (mixup/cutmix/EMA/label_smoothing/RandAug/LLRD) since
-                        # they benefit most. Freeze (linear-probe) trials keep
-                        # basic augmentation for a clean transfer-learning signal.
+                        # they benefit most. SAM only for unfreeze (too slow for
+                        # freeze linear-probe). Freeze trials keep basic aug.
                         advanced = not freeze
                         configs.append(TrialConfig(
                             lr=lr,
@@ -506,8 +506,8 @@ class ResearchAgent:
                             scheduler="cosine",
                             augmentation="advanced" if advanced else "basic",
                             freeze_backbone=freeze,
-                            adapter=adapter,
-                            optimizer="adamw",
+                            adapter="linear_head",
+                            optimizer=opt,
                             mixup=advanced,
                             mixup_alpha=0.8 if advanced else 0.2,
                             cutmix=advanced,
