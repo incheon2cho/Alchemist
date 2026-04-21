@@ -270,13 +270,7 @@ class VLMModel(nn.Module):
         visual_tokens = self.encode_video(video)  # (B, M, D_llm)
 
         # 2. Get text embeddings from LLM
-        # Access the base model's embedding layer
-        if hasattr(self.llm, "model"):
-            embed_layer = self.llm.model.embed_tokens
-        elif hasattr(self.llm, "base_model"):
-            embed_layer = self.llm.base_model.model.model.embed_tokens
-        else:
-            embed_layer = self.llm.get_input_embeddings()
+        embed_layer = self.llm.get_input_embeddings()
 
         text_embeds = embed_layer(input_ids).clone()  # (B, S, D_llm) — clone to allow in-place
 
@@ -309,12 +303,7 @@ class VLMModel(nn.Module):
         B = video.shape[0]
         visual_tokens = self.encode_video(video)
 
-        if hasattr(self.llm, "model"):
-            embed_layer = self.llm.model.embed_tokens
-        elif hasattr(self.llm, "base_model"):
-            embed_layer = self.llm.base_model.model.model.embed_tokens
-        else:
-            embed_layer = self.llm.get_input_embeddings()
+        embed_layer = self.llm.get_input_embeddings()
 
         text_embeds = embed_layer(input_ids).clone()
 
@@ -337,8 +326,34 @@ class VLMModel(nn.Module):
 # Model Loading
 # ---------------------------------------------------------------------------
 
+class DummyVisionEncoder(nn.Module):
+    """Dummy vision encoder that returns random features (for pipeline testing)."""
+    def __init__(self, embed_dim: int = 1408, num_tokens: int = 196):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_tokens = num_tokens
+        self.is_video = True
+        self.proj = nn.Linear(3, embed_dim)  # learnable projection
+
+    def forward(self, x):
+        B = x.shape[0]
+        # Simple: average pool video to (B, 3) then project
+        pooled = x.reshape(B, 3, -1).mean(dim=-1)  # (B, 3)
+        token = self.proj(pooled).unsqueeze(1)  # (B, 1, D)
+        return token.expand(B, self.num_tokens, self.embed_dim)
+
+
 def load_vision_encoder(variant: str = "vjepa2.1_vitg", device="cuda"):
     """Load frozen V-JEPA 2.1 encoder for VLM."""
+    if variant.lower() == "none" or variant.lower() == "dummy":
+        model = DummyVisionEncoder(embed_dim=1408, num_tokens=196)
+        model = model.to(device)
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad = False
+        logger.info("Vision encoder: DUMMY (embed_dim=1408, for pipeline testing)")
+        return model, 1408
+
     try:
         from vjepa_loader import load_vjepa2
     except ImportError:
@@ -373,14 +388,17 @@ def load_llm_with_lora(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load model
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.bfloat16,
-        device_map=device_map,
-        trust_remote_code=True,
-        attn_implementation="flash_attention_2",
-    )
+    # Load model (try flash_attention_2, fallback to sdpa)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch.bfloat16, device_map=device_map,
+            trust_remote_code=True, attn_implementation="flash_attention_2",
+        )
+    except (ImportError, ValueError):
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch.bfloat16, device_map=device_map,
+            trust_remote_code=True, attn_implementation="sdpa",
+        )
 
     # Apply LoRA
     lora_config = LoraConfig(
