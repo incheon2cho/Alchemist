@@ -10,7 +10,7 @@
 
 본 논문은 **Alchemist**를 제안한다: **Benchmark Agent**(4-source retrieval-grounded 모델 탐색)가 유망 후보를 발굴하고, **Controller Agent**(다중 registry 실측 검증 + vision-aware 실시간 감시 + 품질 판정)가 파이프라인 신뢰성을 보장하며, **Research Agent**(26개 기법 자율 적용 + cross-task 경험 누적)가 성능을 극대화하는 3-agent 협업 하네스이다. 핵심은 선형 pipeline이 아닌 **validate-fail-fallback 루프**로, 각 단계의 실패가 chain 전체를 중단시키지 않고 자동 대안 탐색으로 이어진다.
 
-CIFAR-100 / Butterfly / Shopee-IET 3개 데이터셋에서 동일 제약 하에 Alchemist는 AutoML-Agent plan 대비 2/3 dataset 우위(Butterfly 98.1% vs 96.3%, Shopee 98.8% vs 98.1%), CIFAR-100에서 SwinV2-Base + SAM으로 94.32%를 달성하였다. Controller의 early-stop은 R1 compute 40%+를 절감하고, cross-task experience로 후속 task cold-start가 가속됨을 실증하였다.
+CIFAR-100 / Butterfly / Shopee-IET **3개 데이터셋 모두**에서 동일 제약 하에 Alchemist가 AutoML-Agent plan을 상회하였다 (CIFAR-100: 94.32% vs 93.95%, Butterfly: 98.1% vs 96.3%, Shopee: 98.8% vs 98.1%). Controller의 early-stop은 R1 compute 40%+를 절감하고, cross-task experience로 후속 task cold-start가 가속됨을 실증하였다.
 
 ---
 
@@ -98,7 +98,7 @@ Benchmark 추천 "Astroformer" (PwC 93.4%, GitHub 코드 존재)
 
 3. **Cross-task experience accumulation + adaptive tuning**: 실패 모드별 within-round config 자동 조정과, task 간 persistent memory 축적으로 에이전트가 점진적으로 비전 전문가로 성장한다.
 
-4. **3개 benchmark에서 실증**: 동일 제약 하에 Alchemist의 자율 탐색(SwinV2+SAM 94.32% / Butterfly 98.1% / Shopee 98.8%)이 AutoML-Agent plan 대비 우위 또는 동등 성능을 달성하며, 각 에이전트·하네스 구성요소의 ablation 효과를 보인다.
+4. **3개 benchmark 전체에서 AutoML-Agent 상회**: 동일 제약 하에 Alchemist의 자율 탐색이 AutoML-Agent plan을 **3/3 dataset 모두에서** 상회한다 (CIFAR-100 94.32% vs 93.95%, Butterfly 98.1% vs 96.3%, Shopee 98.8% vs 98.1%). 각 에이전트·하네스 구성요소의 ablation 효과를 함께 보인다.
 
 ---
 
