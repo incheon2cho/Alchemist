@@ -177,12 +177,12 @@ class ModelLoader:
     def _try_github_clone(
         model_id: str, num_classes: int, pretrained: bool, **kwargs,
     ) -> nn.Module | None:
-        """Clone a GitHub repo and try to import the model dynamically.
+        """Clone a GitHub repo and auto-discover the model architecture.
 
-        Looks for common patterns:
-          - models/model.py with a build_model() or create_model() function
-          - model.py at repo root
-          - __init__.py with model registration
+        Fully generic — no hardcoded model names. Discovery strategy:
+          1. hubconf.py → torch.hub.load(local) with auto-discovered entry
+          2. Scan all .py files for nn.Module subclasses → instantiate largest
+          3. Try factory functions (build_model, create_model, get_model, etc.)
         """
         try:
             owner_repo = model_id.replace("https://github.com/", "").rstrip("/")
@@ -205,48 +205,44 @@ class ModelLoader:
 
             # Add repo to Python path temporarily
             sys.path.insert(0, str(repo_dir))
-
-            # Try common model loading patterns
             model = None
 
-            # Pattern 1: hubconf.py exists
+            # Strategy 1: hubconf.py → auto-discover entry points
             hubconf = repo_dir / "hubconf.py"
-            if hubconf.exists():
-                model = torch.hub.load(
-                    str(repo_dir), "model",
-                    source="local", pretrained=pretrained,
-                    trust_repo=True,
-                )
-
-            # Pattern 2: models/ directory with build function
-            if model is None:
-                for candidate in ["models/model.py", "model.py", "models/__init__.py"]:
-                    fpath = repo_dir / candidate
-                    if fpath.exists():
-                        import importlib.util
-                        spec = importlib.util.spec_from_file_location("_repo_model", str(fpath))
-                        mod = importlib.util.module_from_spec(spec)
-                        spec.loader.exec_module(mod)
-
-                        # Try common function names
-                        for fn_name in ("build_model", "create_model", "get_model",
-                                         "astroformer", "model"):
-                            fn = getattr(mod, fn_name, None)
-                            if callable(fn):
-                                try:
-                                    model = fn(num_classes=num_classes, pretrained=pretrained)
-                                    break
-                                except Exception:
-                                    try:
-                                        model = fn(num_classes=num_classes)
-                                        break
-                                    except Exception:
-                                        continue
-                    if model is not None:
+            if hubconf.exists() and model is None:
+                import re
+                content = hubconf.read_text(errors="ignore")
+                entry_fns = [
+                    fn for fn in re.findall(r'^def\s+(\w+)\s*\(', content, re.MULTILINE)
+                    if not fn.startswith('_') and fn != 'dependencies'
+                ]
+                for fn_name in entry_fns:
+                    try:
+                        model = torch.hub.load(
+                            str(repo_dir), fn_name,
+                            source="local", pretrained=pretrained,
+                            num_classes=num_classes, trust_repo=True,
+                        )
+                        logger.info("[ModelLoader] loaded via hubconf entry: %s", fn_name)
                         break
+                    except Exception:
+                        try:
+                            model = torch.hub.load(
+                                str(repo_dir), fn_name,
+                                source="local", trust_repo=True,
+                            )
+                            logger.info("[ModelLoader] loaded via hubconf (no num_classes): %s", fn_name)
+                            break
+                        except Exception:
+                            continue
+
+            # Strategy 2: Scan .py files for nn.Module subclasses + factory functions
+            if model is None:
+                model = ModelLoader._scan_and_load(repo_dir, num_classes, pretrained)
 
             # Clean up sys.path
-            sys.path.remove(str(repo_dir))
+            if str(repo_dir) in sys.path:
+                sys.path.remove(str(repo_dir))
 
             if model is not None:
                 logger.info("[ModelLoader] loaded from GitHub clone: %s", owner_repo)
@@ -254,6 +250,122 @@ class ModelLoader:
 
         except Exception as e:
             logger.debug("[ModelLoader] GitHub clone failed for %s: %s", model_id, e)
+            # Clean up sys.path on error
+            repo_dir_str = str(_CACHE_DIR / model_id.replace("https://github.com/", "").rstrip("/").replace("/", "_"))
+            if repo_dir_str in sys.path:
+                sys.path.remove(repo_dir_str)
+        return None
+
+    @staticmethod
+    def _scan_and_load(
+        repo_dir: Path, num_classes: int, pretrained: bool,
+    ) -> nn.Module | None:
+        """Scan repo's Python files to auto-discover model classes and factory functions.
+
+        Strategy:
+          1. Find all .py files (prioritize models/, model.py, network.py)
+          2. Parse for nn.Module subclass definitions
+          3. Try factory functions: build_model, create_model, get_model, make_model
+          4. If no factory, instantiate the largest nn.Module subclass directly
+        """
+        import importlib.util
+        import re
+
+        # Prioritized file search order
+        search_paths = []
+        for pattern in [
+            "models/*.py", "model.py", "network.py", "nets/*.py",
+            "architectures/*.py", "src/models/*.py", "src/model.py",
+            "*.py",  # fallback: scan all root .py files
+        ]:
+            search_paths.extend(sorted(repo_dir.glob(pattern)))
+
+        # Deduplicate while preserving order
+        seen_files = set()
+        unique_paths = []
+        for p in search_paths:
+            if p.name.startswith("_") or p.name in ("setup.py", "train.py", "test.py",
+                                                       "evaluate.py", "demo.py", "hubconf.py"):
+                continue
+            if p not in seen_files:
+                seen_files.add(p)
+                unique_paths.append(p)
+
+        # Common factory function names (generic, no model-specific names)
+        FACTORY_NAMES = [
+            "build_model", "create_model", "get_model", "make_model",
+            "build_network", "create_network", "get_network",
+            "model", "net", "network",
+        ]
+
+        for fpath in unique_paths[:15]:  # limit scan to avoid slow imports
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    f"_repo_{fpath.stem}", str(fpath),
+                )
+                if spec is None or spec.loader is None:
+                    continue
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+
+                # Try factory functions first
+                for fn_name in FACTORY_NAMES:
+                    fn = getattr(mod, fn_name, None)
+                    if not callable(fn):
+                        continue
+                    for call_args in [
+                        {"num_classes": num_classes, "pretrained": pretrained},
+                        {"num_classes": num_classes},
+                        {"n_classes": num_classes},
+                        {},
+                    ]:
+                        try:
+                            result = fn(**call_args)
+                            if isinstance(result, nn.Module):
+                                logger.info(
+                                    "[ModelLoader] loaded via %s:%s(%s)",
+                                    fpath.name, fn_name, call_args,
+                                )
+                                return result
+                        except Exception:
+                            continue
+
+                # Try instantiating nn.Module subclasses directly
+                module_classes = []
+                for attr_name in dir(mod):
+                    attr = getattr(mod, attr_name, None)
+                    if (isinstance(attr, type) and issubclass(attr, nn.Module)
+                            and attr is not nn.Module
+                            and not attr_name.startswith("_")):
+                        module_classes.append((attr_name, attr))
+
+                # Sort by name length descending (heuristic: longer name = more specific model)
+                module_classes.sort(key=lambda x: len(x[0]), reverse=True)
+
+                for cls_name, cls in module_classes[:5]:
+                    for call_args in [
+                        {"num_classes": num_classes},
+                        {"n_classes": num_classes},
+                        {"num_class": num_classes},
+                        {},
+                    ]:
+                        try:
+                            instance = cls(**call_args)
+                            if isinstance(instance, nn.Module):
+                                param_count = sum(p.numel() for p in instance.parameters())
+                                if param_count > 100_000:  # skip tiny test modules
+                                    logger.info(
+                                        "[ModelLoader] instantiated %s:%s (%.1fM params)",
+                                        fpath.name, cls_name, param_count / 1e6,
+                                    )
+                                    return instance
+                        except Exception:
+                            continue
+
+            except Exception as e:
+                logger.debug("[ModelLoader] scan %s failed: %s", fpath.name, type(e).__name__)
+                continue
+
         return None
 
     @staticmethod
