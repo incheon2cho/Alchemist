@@ -130,19 +130,32 @@ class ThreeAgentHarness:
         import timm as _timm
         known_models = set(_timm.list_models())
 
-        def _resolve_timm_id(name: str) -> str | None:
+        def _resolve_model_id(name: str) -> str | None:
+            """Resolve model name across timm, torch.hub, and GitHub."""
             cand = name.replace("timm/", "", 1)
+            # 1. timm direct match
             if cand in known_models:
                 return cand
             if cand.split(".")[0] in known_models:
                 return cand.split(".")[0]
+            # 2. Multi-source check via ModelLoader
+            try:
+                from alchemist.core.model_loader import ModelLoader
+                info = ModelLoader.resolve_model_info(cand)
+                if info.get("loadable"):
+                    logger.info(
+                        "Model '%s' resolvable via %s", cand, info["source"],
+                    )
+                    return cand
+            except ImportError:
+                pass
             return None
 
         # Build list of top-K timm-resolvable + compliant candidates
         candidate_names: list[str] = list(leaderboard.candidates) or ([leaderboard.recommendation] if leaderboard.recommendation else [])
         resolved_candidates: list[str] = []
         for name in candidate_names:
-            tid = _resolve_timm_id(name)
+            tid = _resolve_model_id(name)
             if tid and tid not in resolved_candidates:
                 resolved_candidates.append(tid)
         # If validator rejected or no candidates resolved, widen the search
@@ -150,7 +163,7 @@ class ThreeAgentHarness:
             for entry in leaderboard.entries:
                 if entry.uses_additional_data:
                     continue
-                tid = _resolve_timm_id(entry.model_name)
+                tid = _resolve_model_id(entry.model_name)
                 if tid and tid not in resolved_candidates:
                     resolved_candidates.append(tid)
                 if len(resolved_candidates) >= 3:

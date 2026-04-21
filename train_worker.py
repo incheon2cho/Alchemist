@@ -204,23 +204,29 @@ def build_model(base_model: str, num_classes: int, config: dict, device):
 
         return model, head, embed_dim
     else:
-        # Full fine-tuning with architecture modification
-        model = timm.create_model(
-            base_model, pretrained=True, num_classes=num_classes,
-            drop_rate=drop_rate, drop_path_rate=drop_path,
-        )
+        # Full fine-tuning with architecture modification.
+        # Try multi-source model loading: timm → torch.hub → GitHub clone
+        try:
+            from alchemist.core.model_loader import ModelLoader
+            model = ModelLoader.load(
+                base_model, num_classes=num_classes, pretrained=True,
+                drop_rate=drop_rate, drop_path_rate=drop_path,
+            )
+            logger.info("  Model loaded via ModelLoader (multi-source)")
+        except (ImportError, RuntimeError) as e:
+            # Fallback to timm-only
+            logger.info("  ModelLoader unavailable (%s), falling back to timm", e)
+            model = timm.create_model(
+                base_model, pretrained=True, num_classes=num_classes,
+                drop_rate=drop_rate, drop_path_rate=drop_path,
+            )
 
-        # Apply architecture modifications — universal (works on any timm model)
+        # Apply architecture modifications — universal (works on any model)
         try:
             from alchemist.core.arch_modifier import apply_arch_modifications
             model = apply_arch_modifications(model, config)
         except ImportError:
-            # Fallback to legacy ResNet-only modifier
-            is_resnet = "resnet" in base_model.lower()
-            if is_resnet:
-                model = modify_resnet_architecture(model, config, num_classes)
-                logger.info("  Architecture mods (legacy): SE=%s, Attn=%s",
-                            config.get("add_se"), config.get("add_attention"))
+            pass
 
         model = model.to(device)
         embed_dim = num_classes
