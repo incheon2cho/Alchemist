@@ -205,8 +205,15 @@ def build_model(base_model: str, num_classes: int, config: dict, device):
         return model, head, embed_dim
     else:
         # Full fine-tuning with architecture modification.
-        # Try multi-source model loading: timm → torch.hub → GitHub clone
+        # Try V-JEPA first, then multi-source (timm → torch.hub → GitHub clone)
         try:
+            # Register V-JEPA loader if available
+            try:
+                from alchemist.core.vjepa_loader import register_vjepa_in_model_loader
+                register_vjepa_in_model_loader()
+            except ImportError:
+                pass
+
             from alchemist.core.model_loader import ModelLoader
             model = ModelLoader.load(
                 base_model, num_classes=num_classes, pretrained=True,
