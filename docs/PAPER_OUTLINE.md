@@ -20,7 +20,7 @@ CIFAR-100 / Butterfly / Shopee-IET **3개 데이터셋 모두**에서 동일 제
 
 비전 모델 최적화는 세 단계의 의사결정이 유기적으로 맞물려야 하는 복합 문제이다: **(1) 어떤 모델을 출발점으로 삼을 것인가** (timm, HuggingFace, GitHub 등 수천 개 후보), **(2) 추천된 모델이 현재 파이프라인에서 실제로 로드·학습 가능한지 어떻게 검증할 것인가** (LLM 추론만으로는 모델의 존재 여부, registry 호환성, 해상도 적합성을 판별할 수 없음), **(3) 어떤 기법 조합으로 성능을 극대화할 것인가** (SAM, Mixup, CutMix, EMA, LLRD 등 수십 가지 조합). 기존 연구는 이 세 단계를 개별적으로 다루거나 단일 LLM에 일임하여, 단계 간 정보 단절과 실행 레이어의 silent failure가 발생한다.
 
-AutoML-Agent(ICML 2025)는 LLM 기반 multi-agent로 이를 통합 시도하지만, planning → code generation → execution의 선형 파이프라인에서 **(i) LLM 생성 코드의 런타임 불안정성**(CUDA 초기화 오류, 경로 참조 실패, 원격 환경 비호환 등으로 35/35 실행 실패), **(ii) 성능 기반 피드백 부재**(n_attempts=5의 반복은 코드 에러 수정만 수행하며, validation accuracy 등 metric-driven refinement는 없음)라는 한계를 보인다.
+AutoML-Agent(ICML 2025)는 LLM 기반 multi-agent로 이를 통합 시도하며, 코드 실행 에러 시 error log를 LLM에 피드백하여 코드를 재생성하는 에러 수정 루프(n_attempts=5)를 갖추고 있다. 그러나 **(i) LLM 생성 코드의 구조적 불안정성** — 에러 수정 루프에도 불구하고 CUDA 초기화 레이스 컨디션, 원격 환경 경로 불일치 등 환경 의존적 오류는 동일 패턴을 반복하여 35/35 실행 실패가 발생하였으며, **(ii) 성능 기반 자기 개선의 부재** — 코드가 정상 실행된 후에도 validation accuracy 등 metric을 참조하여 학습 전략을 개선하는 루프가 없어, "코드는 돌아가지만 성능이 낮다"는 상황에서 개선할 수 없다는 한계를 보인다.
 
 ### 1.2 문제 정의: 세 단계의 자율화
 
