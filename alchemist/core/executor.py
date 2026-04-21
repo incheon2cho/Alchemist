@@ -143,6 +143,16 @@ class AWSExecutor(TrainingExecutor):
         self.poll_interval = poll_interval
         self.ssh_timeout = ssh_timeout
 
+    @staticmethod
+    def _select_worker(job: dict) -> str:
+        """Select the appropriate worker script based on task type."""
+        task_name = job.get("task", {}).get("name", "").lower()
+        if task_name in ("llava_video_178k", "video_mme_v2", "vlm_training"):
+            return "vlm_worker.py"
+        if task_name in ("ucf101", "hmdb51", "kinetics", "ssv2", "diving48"):
+            return "video_worker.py"
+        return "train_worker.py"
+
     def _ssh_cmd(self, command: str, timeout: int | None = None) -> subprocess.CompletedProcess:
         """Run a command on the remote host via SSH."""
         cmd = ["ssh"]
@@ -255,7 +265,7 @@ class AWSExecutor(TrainingExecutor):
             (
                 f"cd {self.remote_work_dir} && "
                 f"PYTHONUNBUFFERED=1 nohup {self.remote_python} "
-                f"{'video_worker.py' if job.get('task', {}).get('name', '').lower() in ('ucf101', 'hmdb51', 'kinetics', 'ssv2', 'diving48') else 'train_worker.py'} "
+                f"{self._select_worker(job)} "
                 f"--job {job_file} --output {result_file} "
                 f"--progress {progress_file} "
                 f"> {self.remote_work_dir}/jobs/{job_id}.log 2>&1 "

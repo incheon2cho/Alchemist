@@ -86,6 +86,8 @@ def load_vjepa(
     img_size: int = 224,
     pretrained: bool = True,
     drop_path_rate: float = 0.0,
+    num_frames: int = 16,
+    tubelet_size: int = 2,
 ) -> nn.Module:
     """Load a V-JEPA model with optional pretrained weights + classification head.
 
@@ -95,14 +97,20 @@ def load_vjepa(
         img_size: input image size (224 or 384)
         pretrained: load pretrained V-JEPA weights
         drop_path_rate: stochastic depth rate
+        num_frames: number of video frames (16 for pretrained checkpoint)
+        tubelet_size: temporal patch size (2 for pretrained checkpoint)
 
     Returns:
         nn.Module with .forward(x) → (batch, num_classes) logits
     """
     repo_dir = _ensure_repo_cloned()
 
-    # Add repo src to path for import
+    # Add repo root AND repo src to path for import
+    # V-JEPA uses both `from src.models.xxx` and `from models.xxx`
+    repo_root = str(repo_dir)
     src_dir = str(repo_dir / "src")
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
     if src_dir not in sys.path:
         sys.path.insert(0, src_dir)
 
@@ -125,9 +133,12 @@ def load_vjepa(
             f"Available: {[f for f in dir(vit_module) if f.startswith('vit_')]}"
         )
 
-    # Build the model
+    # Build the model — V-JEPA expects img_size as int, not list
+    # Must pass num_frames and tubelet_size to match pretrained checkpoint
     model = builder(
-        img_size=[img_size],
+        img_size=img_size,
+        num_frames=num_frames,
+        tubelet_size=tubelet_size,
         drop_path_rate=drop_path_rate,
     )
     embed_dim = VJEPA_CONFIGS.get(variant, {}).get("embed_dim", 1280)
@@ -173,9 +184,11 @@ def load_vjepa(
         features = original_forward(x)
         if isinstance(features, (tuple, list)):
             features = features[0]
-        # Global average pooling if needed (B, N, D) → (B, D)
+        # Global average pooling over all patch tokens (B, N, D) → (B, D)
+        # V-JEPA is self-supervised — CLS token is NOT optimized for classification.
+        # Mean pooling over all tokens gives much better linear probe accuracy.
         if features.dim() == 3:
-            features = features[:, 0]  # CLS token or features.mean(dim=1)
+            features = features.mean(dim=1)
         return model.head(features)
 
     model.forward = classification_forward
@@ -188,17 +201,155 @@ def load_vjepa(
     return model
 
 
+# ---------------------------------------------------------------------------
+# V-JEPA 2 — HuggingFace-based loader
+# ---------------------------------------------------------------------------
+
+# V-JEPA 2 model variants on HuggingFace
+VJEPA2_MODELS = {
+    "vjepa2_vitb": "facebook/vjepa2-vitb-fpc64-256",
+    "vjepa2_vitl": "facebook/vjepa2-vitl-fpc64-256",
+    "vjepa2_vitg": "facebook/vjepa2-vitg-fpc64-256",
+    "vjepa2_vitG": "facebook/vjepa2-vitG-fpc64-384",
+    # V-JEPA 2.1 (higher resolution)
+    "vjepa2.1_vitb": "facebook/vjepa2.1-vitb-fpc64-384",
+    "vjepa2.1_vitl": "facebook/vjepa2.1-vitl-fpc64-384",
+    "vjepa2.1_vitg": "facebook/vjepa2.1-vitg-fpc64-384",
+    "vjepa2.1_vitG": "facebook/vjepa2.1-vitG-fpc64-384",
+}
+
+VJEPA2_EMBED_DIMS = {
+    "vitb": 768, "vitl": 1024, "vitg": 1408, "vitG": 1664,
+}
+
+
+def load_vjepa2(
+    variant: str = "vjepa2_vitl",
+    num_classes: int = 101,
+    pretrained: bool = True,
+    for_vlm: bool = False,
+) -> nn.Module:
+    """Load V-JEPA 2 model from HuggingFace.
+
+    Args:
+        variant: model ID, e.g. "vjepa2_vitl", "vjepa2.1_vitg"
+        num_classes: number of output classes
+        pretrained: load pretrained weights
+        for_vlm: if True, return raw encoder without classification head.
+                 Output is (B, N, D) token features for VLM pipelines.
+
+    Returns:
+        nn.Module with .forward(x) → logits or raw features
+        Input x: (B, C, T, H, W) video tensor
+    """
+    # Resolve HuggingFace model ID
+    hf_id = VJEPA2_MODELS.get(variant)
+    if hf_id is None:
+        # Try direct HuggingFace ID
+        if variant.startswith("facebook/"):
+            hf_id = variant
+        else:
+            raise ValueError(
+                f"Unknown V-JEPA2 variant '{variant}'. "
+                f"Available: {list(VJEPA2_MODELS.keys())}"
+            )
+
+    logger.info("[V-JEPA2] Loading %s from HuggingFace...", hf_id)
+
+    # Try torch.hub first (lighter dependency)
+    try:
+        model = torch.hub.load('facebookresearch/vjepa2', variant.replace(".", ""), pretrained=pretrained)
+        embed_dim = getattr(model, "embed_dim", 1024)
+        logger.info("[V-JEPA2] Loaded via torch.hub (embed_dim=%d)", embed_dim)
+    except Exception as hub_err:
+        logger.info("[V-JEPA2] torch.hub failed (%s), trying HuggingFace transformers...", hub_err)
+        try:
+            from transformers import AutoModel
+            model = AutoModel.from_pretrained(hf_id, trust_remote_code=True)
+            # Detect embed_dim from config
+            config = getattr(model, "config", None)
+            embed_dim = getattr(config, "hidden_size", None) or getattr(config, "embed_dim", 1024)
+            logger.info("[V-JEPA2] Loaded via HuggingFace (embed_dim=%d)", embed_dim)
+        except ImportError:
+            raise RuntimeError(
+                "V-JEPA2 requires either torch.hub access or `pip install transformers`. "
+                f"torch.hub error: {hub_err}"
+            )
+
+    # Detect embed_dim from variant name if not found
+    if embed_dim is None:
+        for key, dim in VJEPA2_EMBED_DIMS.items():
+            if key in variant:
+                embed_dim = dim
+                break
+        if embed_dim is None:
+            embed_dim = 1024
+
+    model.embed_dim = embed_dim
+    model.is_video = True
+
+    # VLM mode: return raw encoder features (B, N, D) without head
+    if for_vlm:
+        original_forward = model.forward
+
+        def vlm_forward(x):
+            output = original_forward(x)
+            if hasattr(output, "last_hidden_state"):
+                return output.last_hidden_state
+            elif isinstance(output, (tuple, list)):
+                return output[0]
+            return output
+
+        model.forward = vlm_forward
+        # Freeze all parameters for VLM use
+        for p in model.parameters():
+            p.requires_grad = False
+        logger.info("[V-JEPA2] VLM mode: %s (frozen, embed_dim=%d)", hf_id, embed_dim)
+        return model
+
+    # Classification mode: add head + mean pooling
+    model.head = nn.Linear(embed_dim, num_classes)
+    nn.init.trunc_normal_(model.head.weight, std=0.02)
+    nn.init.zeros_(model.head.bias)
+
+    original_forward = model.forward
+
+    def classification_forward(x):
+        output = original_forward(x)
+        if hasattr(output, "last_hidden_state"):
+            features = output.last_hidden_state
+        elif isinstance(output, (tuple, list)):
+            features = output[0]
+        else:
+            features = output
+        if features.dim() == 3:
+            features = features.mean(dim=1)
+        return model.head(features)
+
+    model.forward = classification_forward
+    logger.info("[V-JEPA2] Ready: %s → %d classes (embed_dim=%d)", hf_id, num_classes, embed_dim)
+    return model
+
+
 # Register V-JEPA in ModelLoader
 def register_vjepa_in_model_loader():
     """Patch ModelLoader to recognize V-JEPA model IDs."""
     try:
-        from alchemist.core.model_loader import ModelLoader
+        try:
+            from model_loader import ModelLoader
+        except ImportError:
+            from alchemist.core.model_loader import ModelLoader
 
-        _original_load = ModelLoader.load.__func__
+        _original_load = ModelLoader.load
 
         @staticmethod
         def load_with_vjepa(model_id, num_classes=100, pretrained=True, **kwargs):
-            # Check if this is a V-JEPA model
+            # Check V-JEPA 2 first (vjepa2_xxx or vjepa2.1_xxx)
+            if model_id.lower().startswith("vjepa2"):
+                return load_vjepa2(
+                    model_id, num_classes=num_classes, pretrained=pretrained,
+                )
+            # Check V-JEPA 1
             if model_id.lower().startswith("vjepa_") or model_id.lower().startswith("v-jepa"):
                 variant = model_id.lower().replace("vjepa_", "").replace("v-jepa_", "").replace("v-jepa-", "")
                 variant_map = {
@@ -212,6 +363,8 @@ def register_vjepa_in_model_loader():
                     v, num_classes=num_classes, img_size=img_size,
                     pretrained=pretrained,
                     drop_path_rate=kwargs.get("drop_path_rate", 0.0),
+                    num_frames=kwargs.get("num_frames", 16),
+                    tubelet_size=kwargs.get("tubelet_size", 2),
                 )
             return _original_load(model_id, num_classes=num_classes, pretrained=pretrained, **kwargs)
 

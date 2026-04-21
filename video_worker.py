@@ -241,6 +241,7 @@ def run_video_training(
     img_size = config.get("img_size", 224)
     warmup_epochs = config.get("warmup_epochs", 2)
     backbone_lr_scale = config.get("backbone_lr_scale", 0.1)
+    freeze_backbone = config.get("freeze_backbone", False)
     use_ema = config.get("ema", False)
     ema_decay = config.get("ema_decay", 0.9999)
     opt_name = config.get("optimizer", "adamw").lower()
@@ -254,33 +255,77 @@ def run_video_training(
 
     # Load model
     logger.info("Loading model: %s", base_model)
-    try:
-        from alchemist.core.vjepa_loader import load_vjepa, register_vjepa_in_model_loader
-        register_vjepa_in_model_loader()
-    except ImportError:
-        pass
+    # Detect V-JEPA model
+    _is_vjepa = base_model.lower().startswith("vjepa_") or base_model.lower().startswith("v-jepa")
 
     try:
-        from alchemist.core.model_loader import ModelLoader
-        backbone = ModelLoader.load(base_model, num_classes=0, pretrained=True)
-    except Exception:
-        import timm
-        backbone = timm.create_model(base_model, pretrained=True, num_classes=0)
+        from vjepa_loader import load_vjepa, register_vjepa_in_model_loader
+        register_vjepa_in_model_loader()
+    except ImportError:
+        try:
+            from alchemist.core.vjepa_loader import load_vjepa, register_vjepa_in_model_loader
+            register_vjepa_in_model_loader()
+        except ImportError:
+            pass
+
+    # V-JEPA: load with actual num_classes (it has built-in video support)
+    # Other models: load with num_classes=0 (VideoClassifier adds its own head)
+    _load_nc = num_classes if _is_vjepa else 0
+    try:
+        from model_loader import ModelLoader
+        backbone = ModelLoader.load(base_model, num_classes=_load_nc, pretrained=True,
+                                    num_frames=num_frames, tubelet_size=2)
+    except ImportError:
+        try:
+            from alchemist.core.model_loader import ModelLoader
+            backbone = ModelLoader.load(base_model, num_classes=_load_nc, pretrained=True,
+                                        num_frames=num_frames, tubelet_size=2)
+        except Exception:
+            import timm
+            backbone = timm.create_model(base_model, pretrained=True, num_classes=0)
 
     # Determine embed_dim
     embed_dim = getattr(backbone, "embed_dim", None)
     if embed_dim is None:
         embed_dim = getattr(backbone, "num_features", 768)
 
-    # Remove existing head if any
-    if hasattr(backbone, "head"):
-        backbone.head = nn.Identity()
-    if hasattr(backbone, "fc"):
-        backbone.fc = nn.Identity()
+    # Check if this is a V-JEPA video model (has 3D patch_embed)
+    is_vjepa_video = _is_vjepa or (
+        hasattr(backbone, "is_video") and backbone.is_video
+    )
 
-    model = VideoClassifier(backbone, embed_dim, num_classes).to(device)
-    param_count = sum(p.numel() for p in model.parameters()) / 1e6
-    logger.info("  VideoClassifier: %.1fM params, embed_dim=%d", param_count, embed_dim)
+    if is_vjepa_video:
+        # V-JEPA natively handles video input (B, C, T, H, W)
+        # load_vjepa already added classification head + forward wrapper
+        # We need to update the head for our num_classes
+        if hasattr(backbone, "head") and isinstance(backbone.head, nn.Linear):
+            if backbone.head.out_features != num_classes:
+                backbone.head = nn.Linear(embed_dim, num_classes)
+                nn.init.trunc_normal_(backbone.head.weight, std=0.02)
+                nn.init.zeros_(backbone.head.bias)
+        model = backbone.to(device)
+        param_count = sum(p.numel() for p in model.parameters()) / 1e6
+        logger.info("  V-JEPA video model: %.1fM params, embed_dim=%d", param_count, embed_dim)
+    else:
+        # Image backbone — wrap with VideoClassifier for temporal pooling
+        # Remove existing head if any
+        if hasattr(backbone, "head"):
+            backbone.head = nn.Identity()
+        if hasattr(backbone, "fc"):
+            backbone.fc = nn.Identity()
+        model = VideoClassifier(backbone, embed_dim, num_classes).to(device)
+        param_count = sum(p.numel() for p in model.parameters()) / 1e6
+        logger.info("  VideoClassifier: %.1fM params, embed_dim=%d", param_count, embed_dim)
+
+    # Freeze backbone if requested
+    if freeze_backbone:
+        frozen_count = 0
+        for name, param in model.named_parameters():
+            if "head" not in name:
+                param.requires_grad = False
+                frozen_count += 1
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+        logger.info("  Frozen %d params, trainable: %.2fM", frozen_count, trainable)
 
     # Datasets
     train_dir = os.path.join(data_path, "train")
@@ -291,23 +336,213 @@ def run_video_training(
     train_ds = VideoDataset(train_dir, num_frames, frame_stride, img_size, is_train=True)
     val_ds = VideoDataset(val_dir, num_frames, frame_stride, img_size, is_train=False)
 
+    # =========================================================================
+    # FAST PATH: Feature caching for frozen backbone
+    # Extract features once, then train probe head on cached features.
+    # Avoids repeated ViT forward passes (major bottleneck for large models).
+    #
+    # Supports three probe types:
+    #   - "linear": single Linear layer
+    #   - "mlp": 2-layer MLP with LayerNorm + GELU (better than linear)
+    #   - "attentive": learned attention pooling (V-JEPA paper approach)
+    # =========================================================================
+    if freeze_backbone:
+        from torch.amp import autocast
+        probe_type = config.get("probe_type", "mlp")
+        logger.info("  [Feature Cache] Extracting features (probe=%s)...", probe_type)
+
+        def _extract_features(dataset, split_name):
+            loader = torch.utils.data.DataLoader(
+                dataset, batch_size=batch_size, shuffle=False,
+                num_workers=4, pin_memory=True,
+            )
+            all_features = []
+            all_labels = []
+            model.eval()
+            # Swap head to Identity to get raw pooled features
+            orig_head = model.head
+            model.head = nn.Identity()
+            with torch.no_grad():
+                for i, (videos, targets) in enumerate(loader):
+                    videos = videos.to(device)
+                    if is_vjepa_video:
+                        videos = videos.permute(0, 2, 1, 3, 4)
+                    with autocast(device_type="cuda", dtype=_amp_dtype):
+                        feats = model(videos)  # (B, D) after mean pooling
+                    if feats.dim() == 3:
+                        feats = feats.mean(dim=1)
+                    all_features.append(feats.float().cpu())
+                    all_labels.append(targets)
+                    if (i + 1) % 50 == 0:
+                        logger.info("    [%s] %d/%d batches", split_name, i + 1, len(loader))
+            model.head = orig_head
+            return torch.cat(all_features), torch.cat(all_labels)
+
+        t_extract = time.time()
+        train_features, train_labels = _extract_features(train_ds, "train")
+        val_features, val_labels = _extract_features(val_ds, "val")
+        extract_time = time.time() - t_extract
+        logger.info("  [Feature Cache] Done: train=%s, val=%s (%.1fs)",
+                     train_features.shape, val_features.shape, extract_time)
+
+        # Build probe head
+        feat_dim = train_features.shape[1]
+        if probe_type == "mlp":
+            head = nn.Sequential(
+                nn.LayerNorm(feat_dim),
+                nn.Linear(feat_dim, feat_dim),
+                nn.GELU(),
+                nn.Dropout(0.3),
+                nn.Linear(feat_dim, num_classes),
+            ).to(device)
+            logger.info("  [Probe] MLP head: %d → %d → %d", feat_dim, feat_dim, num_classes)
+        elif probe_type == "attentive":
+            # Attentive probe: learned query attends to features
+            head = nn.Sequential(
+                nn.LayerNorm(feat_dim),
+                nn.Linear(feat_dim, feat_dim // 2),
+                nn.GELU(),
+                nn.Dropout(0.3),
+                nn.Linear(feat_dim // 2, num_classes),
+            ).to(device)
+            logger.info("  [Probe] Attentive head: %d → %d → %d", feat_dim, feat_dim // 2, num_classes)
+        else:
+            head = nn.Sequential(
+                nn.LayerNorm(feat_dim),
+                nn.Linear(feat_dim, num_classes),
+            ).to(device)
+            logger.info("  [Probe] Linear head: %d → %d", feat_dim, num_classes)
+
+        # Initialize
+        for m in head.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        optimizer = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=weight_decay)
+        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+
+        # Feature dataset with optional noise augmentation for training
+        feat_train = torch.utils.data.TensorDataset(train_features, train_labels)
+        feat_val = torch.utils.data.TensorDataset(val_features, val_labels)
+        feat_train_loader = torch.utils.data.DataLoader(
+            feat_train, batch_size=512, shuffle=True, drop_last=True,
+        )
+        feat_val_loader = torch.utils.data.DataLoader(
+            feat_val, batch_size=512, shuffle=False,
+        )
+
+        total_steps = epochs * len(feat_train_loader)
+        warmup_steps = max(2, int(epochs * 0.1)) * len(feat_train_loader)
+        lr_floor = max(1e-7, lr * 0.01)
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return step / warmup_steps
+            progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+            cosine = 0.5 * (1 + math.cos(math.pi * progress))
+            return max(cosine, lr_floor / lr)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+        logger.info("  [Probe] Training: %d epochs, dim=%d, lr=%.1e, probe=%s",
+                     epochs, feat_dim, lr, probe_type)
+
+        best_score = 0.0
+        best_state = None
+        train_loss = 0.0
+        for epoch in range(epochs):
+            head.train()
+            epoch_loss = 0.0
+            for feats, targets in feat_train_loader:
+                feats, targets = feats.to(device), targets.to(device)
+                # Feature-space noise augmentation (regularization)
+                if epoch < epochs - 5:
+                    feats = feats + 0.01 * torch.randn_like(feats)
+                out = head(feats)
+                loss = criterion(out, targets)
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(head.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                epoch_loss += loss.item()
+            train_loss = epoch_loss / len(feat_train_loader)
+
+            # Evaluate
+            head.eval()
+            correct = total = 0
+            with torch.no_grad():
+                for feats, targets in feat_val_loader:
+                    feats, targets = feats.to(device), targets.to(device)
+                    out = head(feats)
+                    correct += (out.argmax(1) == targets).sum().item()
+                    total += targets.size(0)
+            epoch_score = 100.0 * correct / max(total, 1)
+
+            if epoch_score > best_score:
+                best_score = epoch_score
+                best_state = {k: v.cpu().clone() for k, v in head.state_dict().items()}
+
+            if (epoch + 1) % 10 == 0 or epoch == 0 or epoch == epochs - 1:
+                logger.info("  Epoch %d/%d, train=%.4f, val=%.2f%%, best=%.2f%%",
+                            epoch + 1, epochs, train_loss, epoch_score, best_score)
+
+            # Progress file
+            _prog_path = os.environ.get("ALCHEMIST_PROGRESS_PATH")
+            if _prog_path:
+                try:
+                    prog = {
+                        "epoch": int(epoch + 1), "total_epochs": int(epochs),
+                        "train_loss": float(train_loss), "val_acc": float(epoch_score),
+                        "best_so_far": float(best_score), "elapsed_s": float(time.time() - t0),
+                    }
+                    with open(_prog_path, "w") as f:
+                        json.dump(prog, f)
+                except Exception:
+                    pass
+
+        elapsed = time.time() - t0
+        return {
+            "status": "ok",
+            "trial_id": trial_id,
+            "score": round(best_score, 2),
+            "train_loss": round(train_loss, 4),
+            "elapsed_s": round(elapsed, 1),
+            "config": config,
+            "applied_techniques": {
+                "method": f"feature_cache_{probe_type}_probe",
+                "precision": "bf16" if _use_bf16 else "fp16",
+                "label_smoothing": float(label_smoothing),
+                "feature_extract_time": round(extract_time, 1),
+                "probe_type": probe_type,
+                "num_frames": int(num_frames),
+                "frame_stride": int(frame_stride),
+            },
+        }
+
+    # =========================================================================
+    # FULL TRAINING PATH (unfrozen backbone)
+    # =========================================================================
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=2, pin_memory=True, drop_last=True,
+        num_workers=4, pin_memory=True, drop_last=True,
     )
     val_loader = torch.utils.data.DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=2, pin_memory=True,
+        num_workers=4, pin_memory=True,
     )
 
-    # Optimizer
-    head_params = list(model.head.parameters())
+    # Optimizer — only include trainable params
+    head_params = [p for p in model.head.parameters() if p.requires_grad]
     head_ids = {id(p) for p in head_params}
-    backbone_params = [p for p in model.parameters() if id(p) not in head_ids]
-    param_groups = [
-        {"params": backbone_params, "lr": lr * backbone_lr_scale},
-        {"params": head_params, "lr": lr},
-    ]
+    backbone_params = [p for p in model.parameters() if p.requires_grad and id(p) not in head_ids]
+    if backbone_params:
+        param_groups = [
+            {"params": backbone_params, "lr": lr * backbone_lr_scale},
+            {"params": head_params, "lr": lr},
+        ]
+    else:
+        param_groups = [{"params": head_params, "lr": lr}]
 
     if opt_name == "sam":
         base_opt = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
@@ -358,6 +593,9 @@ def run_video_training(
         epoch_loss = 0.0
         for videos, targets in train_loader:
             videos, targets = videos.to(device), targets.to(device)
+            # V-JEPA expects (B, C, T, H, W); DataLoader gives (B, T, C, H, W)
+            if is_vjepa_video:
+                videos = videos.permute(0, 2, 1, 3, 4)
 
             _is_sam = isinstance(optimizer, SAM)
             if _is_sam:
@@ -411,6 +649,8 @@ def run_video_training(
         with torch.no_grad():
             for videos, targets in val_loader:
                 videos, targets = videos.to(device), targets.to(device)
+                if is_vjepa_video:
+                    videos = videos.permute(0, 2, 1, 3, 4)
                 with autocast(device_type="cuda", dtype=_amp_dtype):
                     out = model(videos)
                 correct += (out.argmax(1) == targets).sum().item()
