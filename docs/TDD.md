@@ -9,24 +9,32 @@
 ```
 alchemist/
 ├── core/
-│   ├── schemas.py        — UserTask, Leaderboard, ResearchResult, ExperimentState
+│   ├── schemas.py        — UserTask, Leaderboard(+candidates), TrialConfig(20 fields), ResearchResult
 │   ├── llm.py            — LLMClient ABC, MockLLMClient, ClaudeCLIClient, CodexCLIClient
-│   ├── executor.py       — TrainingExecutor (LocalExecutor, AWSExecutor)
+│   ├── executor.py       — TrainingExecutor (LocalExecutor, AWSExecutor + early-stop polling + SSH Popen)
 │   ├── utils.py          — safe_asdict (enum 직렬화)
-│   └── retrievers/       — v3 NEW: 외부 지식 검색 모듈 (공용)
-│       ├── __init__.py   — exports
-│       ├── arxiv.py      — ArxivRetriever (Research Agent 사용)
+│   ├── experience_store.py — v5 NEW: VisionExperienceStore (cross-task persistent JSONL)
+│   ├── arch_modifier.py  — v5 NEW: VisionArchModifier (범용 SE/CBAM/LoRA/Adapter/SelfAttn 주입)
+│   └── retrievers/       — 외부 지식 검색 모듈 (4-source)
+│       ├── __init__.py   — exports (ArxivRetriever, GitHubRetriever, HFHubRetriever)
+│       ├── arxiv.py      — ArxivRetriever (year-filtered 논문 검색)
+│       ├── github.py     — v5 NEW: GitHubRetriever (모델 repo 검색 + torch.hub 확인)
 │       └── hf_hub.py     — HFHubRetriever (Benchmark 주, Research 보조)
 │                           - search_imagenet1k_models (모델 라이브 검색)
-│                           - search_pwc_leaderboard (SoTA 표준)
-│                           - classify_pretrain_source (정책 필터)
+│                           - timm_imagenet_top1 (공식 CSV 1,266모델 실측 성능)
+│                           - search_pwc_leaderboard (task-specific SoTA)
+│                           - classify_pretrain_source (6-tier 정책 필터)
 ├── agents/
 │   ├── protocol.py       — AgentMessage, MessageBus, make_directive/response
-│   ├── benchmark.py      — BenchmarkAgent (모델 탐색 + 순위화 + SoTA standing)
-│   ├── research.py       — ResearchAgent (기법 탐색 + NAS + HP 탐색 + 자율 개선)
-│   └── controller.py     — ControllerAgent (통제 + Safety + Ship 판정)
-├── harness.py            — ThreeAgentHarness (통합 오케스트레이터)
-├── main.py               — CLI 엔트리포인트
+│   ├── benchmark.py      — BenchmarkAgent (4-source 탐색 + HF-first ranking + top-K candidates)
+│   ├── research.py       — ResearchAgent (26-technique catalog + adaptive tuning + experience + closed-loop)
+│   │                       - VISION_TECHNIQUE_CATALOG (26개 기법 → config 매핑)
+│   │                       - _adapt_config_from_failures (within-round 자동 조정)
+│   │                       - VisionExperienceStore 연동 (record + retrieve)
+│   └── controller.py     — ControllerAgent (validate + top-K eval + early-stop + ship judgment)
+│                           - evaluate_trial_progress (vision-aware 4-rule early-stop)
+├── harness.py            — ThreeAgentHarness (validate-fail-fallback 루프 + Controller wire-up)
+├── main.py               — CLI 엔트리포인트 (run / research 서브커맨드)
 ├── export_dashboard.py   — Dashboard JSON 변환
 ├── nas_worker.py         — EC2 NAS 학습 워커 (ViT/Swin/Mamba 포함)
 └── train_worker.py       — EC2 학습 워커 (ResNet 중심)
@@ -235,6 +243,21 @@ alchemist/
 | test_harness.py | 12 | 통합 파이프라인 |
 | test_edge_cases.py | 22 | 엣지 케이스 |
 | **합계** | **54** | **ALL PASS** |
+
+### v5 추가 필요 테스트 (미구현)
+
+| 모듈 | 테스트 항목 | 우선순위 |
+|------|-----------|---------|
+| `VisionExperienceStore` | record/retrieve/similarity 검증 | 높음 |
+| `VisionArchModifier` | ConvNeXt/SwinV2/ViT에 SE/LoRA/Adapter 주입 + forward pass | 높음 |
+| `GitHubRetriever` | API 검색 + torch.hub 확인 + cache | 중간 |
+| `evaluate_trial_progress` | 4-rule early-stop 판정 (catastrophic/hopeless/divergence/collapse) | 높음 |
+| `_adapt_config_from_failures` | OOM→batch÷2, catastrophic→lr cap, collapse→epochs cap | 높음 |
+| `Closed-loop verification` | proposed vs applied mismatch 감지 | 중간 |
+| `SAM optimizer` | 2-step forward/backward + state 분리 | 높음 |
+| `train_worker bf16` | bfloat16 autocast + GradScaler disabled | 중간 |
+| `EMA per-batch` | batch-level update + NaN guard + restore | 높음 |
+| `img_size auto-detect` | SwinV2(256) / ViT(224) / MaxViT(256) 자동 감지 | 중간 |
 
 ---
 

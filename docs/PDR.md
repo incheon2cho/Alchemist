@@ -23,13 +23,14 @@
 
 | Agent | 역할 | 핵심 산출물 |
 |-------|------|-----------|
-| **Benchmark Agent** | 최신 논문/모델 탐색 + 다중 벤치마크 성능 측정 + 모델 순위화 + **SoTA 현황 조사** | **Leaderboard + SoTA Standing** |
-| **Research Agent** | Leaderboard 최고 모델을 가져와 **SoTA를 넘기 위한** 기법 탐색 + HP/아키텍처 자율 수정 | **최적화된 모델 + 성능 리포트** |
-| **Controller Agent** | 1,2 통제 — 파이프라인 오케스트레이션, Safety, 결과 판정 | **실험 이력 + Ship 판정** |
+| **Benchmark Agent** | 4-source 모델 탐색 (HF Hub + PwC + GitHub + arXiv) + timm ImageNet top-1 기반 순위화 + SoTA 현황 조사 | **Leaderboard + Top-K Candidates + SoTA Standing** |
+| **Research Agent** | 26개 Vision Technique Catalog 기반 자율 기법 적용 + SAM/LoRA/Adapter 등 아키텍처 수정 + closed-loop 검증 + cross-task 경험 축적 | **최적화된 모델 + 성능 리포트 + Experience** |
+| **Controller Agent** | 추천 검증(다중 registry) + top-K 실측 baseline + vision-aware early-stop(4-rule) + 품질 판정 | **Winner 선정 + 실시간 감시 + Ship 판정** |
 
-**에이전트간 지식 역할 분리 (v3에서 명확화):**
-- **Benchmark = "무엇이 최고 점수인가?"** (what number to beat)
-- **Research = "어떻게 그 점수를 뛰어넘는가?"** (how to beat it)
+**에이전트간 역할 분리 (v5 업데이트):**
+- **Benchmark = "어떤 모델이 유망한가?"** (4-source retrieval-grounded 탐색)
+- **Controller = "추천이 실제로 작동하는가?"** (실측 검증 + 실시간 감시)
+- **Research = "어떤 기법 조합이 최고 성능인가?"** (자율 탐색 + 경험 축적)
 
 ---
 
@@ -99,10 +100,12 @@ Benchmark Agent
     └── 사용자 태스크 + 제약조건 기반 추천
 ```
 
-**External knowledge sources (v3에서 추가):**
-- **HuggingFace Hub API** (`huggingface_hub`) — 모델 라이브 검색·메타데이터
-- **PwC Archive** (`pwc-archive/evaluation-tables` HF parquet) — 최종 SoTA 스냅샷 (2025-09)
-- 모두 **무료 공개 API**, 인증 불필요, 7일 file cache
+**External knowledge sources (v5 업데이트):**
+- **HuggingFace Hub API** (`huggingface_hub`) — 모델 라이브 검색 + timm ImageNet top-1 CSV (1,266모델 실측 성능)
+- **PwC Archive** (`pwc-archive/evaluation-tables` HF parquet) — task-specific SoTA 리더보드
+- **GitHub API** — 공개 모델 저장소 검색 + `torch.hub` 호환성 확인 + pretrained 가용성
+- **arXiv API** — 2023-2025 최신 논문 year-filtered 검색
+- 모두 **무료 공개 API**, 인증 불필요, file cache (7일-30일)
 
 **핵심 스키마:**
 
@@ -152,52 +155,63 @@ class UserTask:
 **내부 구조:**
 
 ```
-Research Agent
-├── Technique Retrieval (ArxivRetriever) ← v3: arXiv API
-│   ├── search() 벤치마크/기법 키워드 → 최근 3년 논문
-│   ├── summarize_for_llm() LLM 프롬프트 주입용 텍스트
-│   └── 7일 file cache (~/.cache/alchemist/retrievers/)
+Research Agent (v5 업데이트)
+├── Vision Technique Catalog (26개 기법) ← v5 NEW
+│   ├── SoTA 기법명 → concrete config override 자동 매핑
+│   ├── Optimizer: SAM(3종), AdamW, SGD
+│   ├── Augmentation: Mixup(2종), CutMix(2종), RandAug, RandomErasing
+│   ├── Regularization: StochasticDepth(2종), LabelSmoothing, EMA, LLRD, WD(2종)
+│   ├── Schedule: CosineRestarts, OneCycle, LongerTraining(2종)
+│   └── Architecture: SE, CBAM, SelfAttention2D, LoRA(2종), Adapter
 │
-├── SoTA Synthesis (LLM + Benchmark Standing + arXiv) ← v3 재구성
-│   ├── Benchmark Agent의 sota_standing(PwC) 입력 사용
-│   ├── arXiv 기법 논문 evidence 결합
-│   └── search_sota(task, sota_standing) → 기법 요약
+├── VisionArchModifier (범용 아키텍처 수정) ← v5 NEW
+│   ├── 모든 timm 모델 구조 자동 분석 (conv stages, transformer blocks, attn projections)
+│   ├── inject_se/cbam/self_attention (CNN용)
+│   ├── inject_lora (ViT/SwinV2 attention용)
+│   └── inject_adapter (Houlsby bottleneck)
 │
-├── Gap Analysis & Technique Suggestion (LLM)
-│   ├── Gap Analysis: 현재 결과 vs SoTA 차이 분석
-│   └── Technique Suggestion: 부족한 기법 자동 제안
-│       (optimizer: SAM, pretrained: IN-22K/JFT, 학습 전략 등)
+├── Closed-Loop Technique Verification ← v5 NEW
+│   ├── 매 trial 후 proposed config vs applied_techniques 비교
+│   └── Silent drop 즉시 감지 (MISMATCH 경고)
 │
-├── Experiment Designer (LLM + SoTA Knowledge)
-│   ├── Round 1: 탐색 공간 설계 (HP 범위, 아키텍처 변형)
-│   └── Round 2+: SoTA gap 기반 targeted refinement
+├── Within-Round Adaptive Tuning ← v5 NEW
+│   ├── catastrophic → lr cap
+│   ├── divergence → aug α 감쇠 + lr 하향
+│   ├── OOM → batch÷2 (consecutive success 후 forgiveness)
+│   └── collapse → epochs cap + warmup 강화 + batch 하한
 │
-├── NAS (Architecture Search)
-│   ├── Phase 1: 다중 backbone 탐색 (CNN/ViT/Swin/Mamba)
-│   └── Phase 2: Top-K backbone 집중 HP 최적화
+├── Cross-Task VisionExperienceStore ← v5 NEW
+│   ├── record(): winning config + techniques + 실패 경험 → persistent JSONL
+│   ├── retrieve_similar(): num_classes bucket + keyword Jaccard 유사도
+│   └── summarize_for_prompt(): LLM 프롬프트 "prior experience" 섹션
 │
-├── Self-Analysis Loop (LLM)
-│   ├── 실험 결과 패턴 분석 (어떤 HP가 효과적인지)
-│   ├── SoTA 대비 gap 분석 (부족한 기법 식별)
-│   └── 계속/중단 자율 판단
+├── SoTA Synthesis (LLM + Benchmark + arXiv + Experience)
+│   ├── search_sota(): arXiv + PwC + 이전 task 경험 결합
+│   └── analyze_sota_gap(): 현재 vs SoTA gap + 미사용 기법 식별
 │
-├── HP Searcher (결정적)
-│   └── LR / batch size / freeze / adapter / optimizer 조합 탐색
+├── Experiment Designer
+│   ├── R1: v019-informed grid (SAM rho/lr/LLRD/drop_path/EMA sweep)
+│   └── R2+: suggest_techniques() catalog-driven + LLM-driven 2-path
 │
-├── Trainer (결정적, Local or AWS GPU)
-│   └── Fine-tuning / Linear Probe 실행 + 평가
+├── train_worker.py (EC2 실행)
+│   ├── SAM 2-step optimizer (AdamW base)
+│   ├── bfloat16 mixed precision (A10G native, overflow 방지)
+│   ├── EMA per-batch update + NaN guard
+│   ├── Warmup 자동 스케일링 + LR floor
+│   ├── img_size 자동 감지 (timm resolve_model_data_config)
+│   ├── apply_arch_modifications() (범용 SE/CBAM/LoRA/Adapter 주입)
+│   ├── Per-epoch progress.json (Controller Surveil용)
+│   └── applied_techniques dict (closed-loop 검증용)
 │
-├── Research Log
-│   └── 전 과정 기록 (SoTA 검색, 분석, 설계, 실행, 판단)
-│
-└── Report Generator (LLM)
-    └── 최종 리포트 + SoTA 대비 포지셔닝 문서화
+├── Research Log (전 과정 JSON 기록)
+└── Report Generator (LLM 최종 리포트)
 ```
 
-**External knowledge sources (v3에서 추가):**
-- **arXiv API** (`arxiv` 라이브러리) — 기법 논문 검색, 연도 필터, free public
-- (Benchmark Agent로부터) **PwC archive 기반 sota_standing** — "어느 점수를 넘어야 하는가"
-- 모두 무료, 인증 불필요, 7일 file cache
+**External knowledge sources (v5 업데이트):**
+- **arXiv API** — 기법 논문 검색, 연도 필터
+- **Benchmark Agent로부터** PwC SoTA standing + timm top-1 + GitHub repos
+- **VisionExperienceStore** — 이전 task의 winning config (cross-task transfer)
+- 모두 무료, 인증 불필요, file cache
 
 **자율 개선 흐름:**
 
@@ -261,17 +275,26 @@ class ResearchResult:
 ### 3.3 Controller Agent (AD-3)
 
 ```
-Controller Agent
-├── Pipeline Orchestrator
-│   └── Benchmark → Research 순차 실행
+Controller Agent (v5 업데이트)
+├── Task Formalizer
+│   └── 자연어 task → typed 제약 파싱 (pretrain 소스, HW, img_size)
+├── Recommendation Validator
+│   ├── LLM 기반 제약 적합성 검증
+│   ├── timm / HF / GitHub torch.hub 다중 registry 확인
+│   └── timm ID resolution + img_size 자동 감지
+├── Top-K Empirical Evaluator (v5 NEW)
+│   ├── 후보 모델들을 실제 GPU에서 frozen baseline 평가
+│   └── LLM 추론의 empirical 교차 검증 → Winner 선정
+├── Vision-Aware Early-Stop (v5 NEW)
+│   ├── 매 epoch progress.json 모니터링
+│   ├── 4-rule 감지: catastrophic / hopeless / divergence / collapse
+│   └── SSH-kill로 hopeless trial 선제 종료 (40%+ compute 절감)
 ├── Safety Guard
-│   ├── Budget 추적, 성능 하락 감지
+│   ├── Budget 추적, OOM 핸들링
 │   └── Human Escalation Gate
-├── Registry
-│   └── Leaderboard + Research 이력 관리
-└── DECIDE
-    ├── 모델 추천 승인/거부
-    └── Ship 판정
+└── Ship Judgment
+    ├── baseline 대비 improvement 평가
+    └── 절대 score + budget 사용률 기준 판정
 ```
 
 ### 3.4 Agent 간 통신
