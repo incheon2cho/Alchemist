@@ -254,7 +254,8 @@ class AWSExecutor(TrainingExecutor):
             self.host,
             (
                 f"cd {self.remote_work_dir} && "
-                f"PYTHONUNBUFFERED=1 nohup {self.remote_python} train_worker.py "
+                f"PYTHONUNBUFFERED=1 nohup {self.remote_python} "
+                f"{'video_worker.py' if job.get('task', {}).get('name', '').lower() in ('ucf101', 'hmdb51', 'kinetics', 'ssv2', 'diving48') else 'train_worker.py'} "
                 f"--job {job_file} --output {result_file} "
                 f"--progress {progress_file} "
                 f"> {self.remote_work_dir}/jobs/{job_id}.log 2>&1 "

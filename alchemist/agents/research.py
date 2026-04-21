@@ -86,6 +86,12 @@ VISION_TECHNIQUE_CATALOG: dict[str, dict] = {
     "lora_attn":            {"extra": {"add_lora": True, "lora_rank": 8, "lora_targets": "attn"}},
     "lora_qkv":             {"extra": {"add_lora": True, "lora_rank": 4, "lora_targets": "qkv"}},
     "adapter_houlsby":      {"extra": {"add_adapter": True, "adapter_bottleneck": 64}},
+    # --- Video-specific techniques ---
+    "video_8frames":        {"extra": {"num_frames": 8, "frame_stride": 4}},
+    "video_16frames":       {"extra": {"num_frames": 16, "frame_stride": 4}},
+    "video_32frames":       {"extra": {"num_frames": 32, "frame_stride": 2}},
+    "video_dense_sampling": {"extra": {"num_frames": 16, "frame_stride": 2}},
+    "video_sparse_sampling":{"extra": {"num_frames": 8, "frame_stride": 8}},
 }
 
 
