@@ -41,22 +41,28 @@ def load_video_frames(
     video_path: str,
     num_frames: int = 16,
     img_size: int = 384,
+    return_timestamps: bool = False,
 ) -> torch.Tensor:
     """Load and preprocess video frames.
 
     Returns: (C, T, H, W) tensor normalized with ImageNet stats.
+             If return_timestamps=True, also returns list of float seconds.
     """
     import decord
     decord.bridge.set_bridge("torch")
 
     vr = decord.VideoReader(video_path, num_threads=1)
     total = len(vr)
+    fps = vr.get_avg_fps() or 30.0
 
     # Uniform temporal sampling
     if total >= num_frames:
         indices = torch.linspace(0, total - 1, num_frames).long().tolist()
     else:
         indices = list(range(total)) + [total - 1] * (num_frames - total)
+
+    # Compute timestamps in seconds
+    timestamps = [idx / fps for idx in indices]
 
     frames = vr.get_batch(indices)  # (T, H, W, C)
     frames = frames.float() / 255.0
@@ -71,7 +77,10 @@ def load_video_frames(
     frames = (frames - mean) / std
 
     # (T, C, H, W) → (C, T, H, W) for V-JEPA
-    return frames.permute(1, 0, 2, 3)
+    video_tensor = frames.permute(1, 0, 2, 3)
+    if return_timestamps:
+        return video_tensor, timestamps
+    return video_tensor
 
 
 # ---------------------------------------------------------------------------
@@ -157,9 +166,12 @@ class VLMVideoDataset(torch.utils.data.Dataset):
         if not os.path.isabs(video_path):
             video_path = os.path.join(self.video_dir, video_path)
 
-        # Load video — try next valid sample if unavailable (no synthetic)
+        # Load video with timestamps
+        timestamps = None
         try:
-            video = load_video_frames(video_path, self.num_frames, self.img_size)
+            video, timestamps = load_video_frames(
+                video_path, self.num_frames, self.img_size, return_timestamps=True
+            )
         except Exception:
             # Find next valid sample (bounded search, no recursion)
             for offset in range(1, min(100, len(self))):
@@ -170,18 +182,19 @@ class VLMVideoDataset(torch.utils.data.Dataset):
                     next_vid = os.path.join(self.video_dir, next_vid)
                 if os.path.exists(next_vid):
                     try:
-                        video = load_video_frames(next_vid, self.num_frames, self.img_size)
+                        video, timestamps = load_video_frames(
+                            next_vid, self.num_frames, self.img_size, return_timestamps=True
+                        )
                         sample = next_sample
                         conversations = sample.get("conversations", [])
                         break
                     except Exception:
                         continue
             else:
-                # All nearby samples failed — return dummy
                 video = torch.zeros(3, self.num_frames, self.img_size, self.img_size)
+                timestamps = [i * 0.5 for i in range(self.num_frames)]
 
         # Build conversation text
-        # Format: <image> tokens + human question + gpt answer
         input_text = ""
         target_text = ""
 
@@ -190,15 +203,20 @@ class VLMVideoDataset(torch.utils.data.Dataset):
             value = turn.get("value", "")
 
             if role == "human":
-                # Replace <image> placeholder in human message
                 value = value.replace("<image>", "").replace("\n", " ").strip()
                 input_text += f"User: {value}\n"
             elif role == "gpt":
                 target_text += value.strip()
 
-        # Tokenize: [visual_placeholders] + [human_text] + [gpt_response]
-        # Visual placeholders will be replaced with actual visual tokens in the model
-        visual_placeholder = IMAGE_TOKEN * self.num_visual_tokens
+        # Build visual placeholder with timestamp tokens
+        # Format: <t=0.0s>[img][img]...<t=0.5s>[img][img]...
+        tokens_per_frame = self.num_visual_tokens // self.num_frames
+        visual_parts = []
+        for i in range(self.num_frames):
+            t = timestamps[i] if timestamps else i * 0.5
+            visual_parts.append(f"<t={t:.1f}s>" + IMAGE_TOKEN * tokens_per_frame)
+        visual_placeholder = "".join(visual_parts)
+
         full_text = f"{visual_placeholder}\n{input_text}Assistant: {target_text}"
 
         encoding = self.tokenizer(
@@ -782,11 +800,17 @@ def run_vlm_eval(
     skipped = 0
     image_token_id = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
 
+    # Per-category tracking
+    from collections import defaultdict
+    duration_stats = defaultdict(lambda: {"correct": 0, "total": 0})
+    qtype_stats = defaultdict(lambda: {"correct": 0, "total": 0})
+
     for sample in eval_ds:
         video_id = sample.get("video_id", "")
         question = sample.get("question", "")
         options = sample.get("options", "")
         answer = sample.get("answer", "")
+        duration = sample.get("duration", "unknown")
 
         if not question:
             continue
@@ -799,15 +823,28 @@ def run_vlm_eval(
 
         # Load video
         try:
-            video = load_video_frames(video_file, num_frames, img_size)
+            video, timestamps = load_video_frames(
+                video_file, num_frames, img_size, return_timestamps=True
+            )
             video = video.unsqueeze(0).to(device)  # (1, C, T, H, W)
         except Exception:
             skipped += 1
             continue
 
-        # Build prompt
-        visual_placeholder = IMAGE_TOKEN * num_visual_tokens
-        prompt = f"{visual_placeholder}\nQuestion: {question}\nOptions: {options}\nAnswer:"
+        # Format options
+        if isinstance(options, list):
+            options_str = "\n".join(options)
+        else:
+            options_str = options
+
+        # Build prompt with timestamp tokens
+        tokens_per_frame = num_visual_tokens // num_frames
+        visual_parts = []
+        for i in range(num_frames):
+            t = timestamps[i] if timestamps else i * 0.5
+            visual_parts.append(f"<t={t:.1f}s>" + IMAGE_TOKEN * tokens_per_frame)
+        visual_placeholder = "".join(visual_parts)
+        prompt = f"{visual_placeholder}\nQuestion: {question}\nOptions:\n{options_str}\nAnswer:"
 
         encoding = tokenizer(prompt, return_tensors="pt", max_length=1024, truncation=True)
         input_ids = encoding["input_ids"].to(device)
@@ -828,19 +865,54 @@ def run_vlm_eval(
                     predicted = char.upper()
                     break
 
-            if predicted == answer.strip().upper():
+            is_correct = predicted == answer.strip().upper()
+            if is_correct:
                 correct += 1
             total += 1
+
+            # Track by duration
+            duration_stats[duration]["total"] += 1
+            if is_correct:
+                duration_stats[duration]["correct"] += 1
+
+            # Track by question type
+            q_lower = question.lower()
+            if any(k in q_lower for k in ["when", "before", "after", "first", "last", "order"]):
+                qtype = "temporal"
+            elif any(k in q_lower for k in ["how many", "count", "number"]):
+                qtype = "counting"
+            elif any(k in q_lower for k in ["why", "reason", "cause"]):
+                qtype = "causal"
+            else:
+                qtype = "descriptive"
+            qtype_stats[qtype]["total"] += 1
+            if is_correct:
+                qtype_stats[qtype]["correct"] += 1
+
         except Exception:
             continue
 
-        if total % 50 == 0 and total > 0:
+        if total % 100 == 0 and total > 0:
             logger.info("  [eval] %d/%d correct so far (%.1f%%), skipped=%d",
                         correct, total, 100.0 * correct / total, skipped)
 
     accuracy = 100.0 * correct / max(total, 1)
     logger.info("  Video-MME eval: %d/%d correct (%.2f%%), %d skipped (no video)",
                 correct, total, accuracy, skipped)
+
+    # Detailed breakdown
+    logger.info("  === Duration Breakdown ===")
+    for dur in ["short", "medium", "long"]:
+        s = duration_stats.get(dur, {"correct": 0, "total": 0})
+        acc = 100.0 * s["correct"] / max(s["total"], 1)
+        logger.info("    %s: %d/%d = %.1f%%", dur, s["correct"], s["total"], acc)
+
+    logger.info("  === Question Type Breakdown ===")
+    for qt in ["descriptive", "temporal", "counting", "causal"]:
+        s = qtype_stats.get(qt, {"correct": 0, "total": 0})
+        acc = 100.0 * s["correct"] / max(s["total"], 1)
+        logger.info("    %s: %d/%d = %.1f%%", qt, s["correct"], s["total"], acc)
+
     return accuracy
 
 
