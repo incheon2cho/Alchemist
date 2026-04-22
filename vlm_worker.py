@@ -124,6 +124,19 @@ class VLMVideoDataset(torch.utils.data.Dataset):
             except Exception:
                 raise ValueError(f"Cannot load data from {data_path}")
 
+        # Pre-filter: only keep samples with existing video files
+        before = len(self.samples)
+        valid_samples = []
+        for s in self.samples:
+            vid = s.get("video", "")
+            if not vid:
+                continue
+            full_path = os.path.join(video_dir, vid) if not os.path.isabs(vid) else vid
+            if os.path.exists(full_path):
+                valid_samples.append(s)
+        self.samples = valid_samples
+        logger.info("  Pre-filtered: %d/%d samples have video files", len(self.samples), before)
+
         # Ensure IMAGE_TOKEN_ID exists in tokenizer
         if IMAGE_TOKEN not in tokenizer.get_vocab():
             tokenizer.add_special_tokens({"additional_special_tokens": [IMAGE_TOKEN]})
@@ -144,12 +157,28 @@ class VLMVideoDataset(torch.utils.data.Dataset):
         if not os.path.isabs(video_path):
             video_path = os.path.join(self.video_dir, video_path)
 
-        # Load video
+        # Load video — try next valid sample if unavailable (no synthetic)
         try:
             video = load_video_frames(video_path, self.num_frames, self.img_size)
         except Exception:
-            # Fallback: random tensor if video not available
-            video = torch.randn(3, self.num_frames, self.img_size, self.img_size)
+            # Find next valid sample (bounded search, no recursion)
+            for offset in range(1, min(100, len(self))):
+                next_idx = (idx + offset) % len(self)
+                next_sample = self.samples[next_idx]
+                next_vid = next_sample.get("video", "")
+                if not os.path.isabs(next_vid):
+                    next_vid = os.path.join(self.video_dir, next_vid)
+                if os.path.exists(next_vid):
+                    try:
+                        video = load_video_frames(next_vid, self.num_frames, self.img_size)
+                        sample = next_sample
+                        conversations = sample.get("conversations", [])
+                        break
+                    except Exception:
+                        continue
+            else:
+                # All nearby samples failed — return dummy
+                video = torch.zeros(3, self.num_frames, self.img_size, self.img_size)
 
         # Build conversation text
         # Format: <image> tokens + human question + gpt answer
@@ -519,6 +548,21 @@ def run_vlm_training(
         tokenizer.add_special_tokens({"additional_special_tokens": [IMAGE_TOKEN]})
         llm.resize_token_embeddings(len(tokenizer))
 
+    # Resume from checkpoint if specified
+    resume_from = config.get("resume_from", "")
+    if resume_from and os.path.isdir(resume_from):
+        ckpt_abstractor = os.path.join(resume_from, "c_abstractor.pt")
+        ckpt_lora = os.path.join(resume_from, "lora_adapter")
+        if os.path.exists(ckpt_abstractor):
+            abstractor.load_state_dict(torch.load(ckpt_abstractor, map_location=device))
+            logger.info("  Resumed C-Abstractor from %s", ckpt_abstractor)
+        if os.path.isdir(ckpt_lora):
+            try:
+                llm.load_adapter(ckpt_lora, adapter_name="default")
+                logger.info("  Resumed LoRA adapter from %s", ckpt_lora)
+            except Exception as e:
+                logger.warning("  LoRA resume failed: %s (continuing with current weights)", e)
+
     image_token_id = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
 
     # 4. Build VLM model
@@ -606,9 +650,29 @@ def run_vlm_training(
                         scheduler.get_last_lr()[0],
                     )
 
+                # Mid-training checkpoint at configurable interval
+                save_every = config.get("save_every_steps", 0)
+                if save_every > 0 and global_step % save_every == 0:
+                    mid_ckpt = Path(f"/home/ubuntu/checkpoints/vlm/vlm_trial{trial_id}_step{global_step}")
+                    mid_ckpt.mkdir(parents=True, exist_ok=True)
+                    torch.save(abstractor.state_dict(), mid_ckpt / "c_abstractor.pt")
+                    llm.save_pretrained(str(mid_ckpt / "lora_adapter"))
+                    logger.info("  [checkpoint] Saved at step %d → %s", global_step, mid_ckpt)
+
+                # Early stop at max_steps if set
+                max_steps = config.get("max_steps", 0)
+                if max_steps > 0 and global_step >= max_steps:
+                    logger.info("  [early-stop] Reached max_steps=%d, stopping training", max_steps)
+                    break
+
             # Free GPU memory
             del video, outputs, loss
             torch.cuda.empty_cache()
+
+        # Check if early stopped
+        max_steps = config.get("max_steps", 0)
+        if max_steps > 0 and global_step >= max_steps:
+            break
 
         # Epoch summary
         avg_loss = epoch_loss / max(num_batches, 1)

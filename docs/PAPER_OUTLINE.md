@@ -20,7 +20,7 @@ CIFAR-100 / Butterfly / Shopee-IET **3개 데이터셋 모두**에서 동일 제
 
 비전 모델 최적화는 세 단계의 의사결정이 유기적으로 맞물려야 하는 복합 문제이다: **(1) 어떤 모델을 출발점으로 삼을 것인가** (timm, HuggingFace, GitHub 등 수천 개 후보), **(2) 추천된 모델이 현재 파이프라인에서 실제로 로드·학습 가능한지 어떻게 검증할 것인가** (LLM 추론만으로는 모델의 존재 여부, registry 호환성, 해상도 적합성을 판별할 수 없음), **(3) 어떤 기법 조합으로 성능을 극대화할 것인가** (SAM, Mixup, CutMix, EMA, LLRD 등 수십 가지 조합). 기존 연구는 이 세 단계를 개별적으로 다루거나 단일 LLM에 일임하여, 단계 간 정보 단절과 실행 레이어의 silent failure가 발생한다.
 
-AutoML-Agent(ICML 2025)는 LLM 기반 multi-agent로 이를 통합 시도하며, 코드 실행 에러 시 error log를 LLM에 피드백하여 코드를 재생성하는 에러 수정 루프(n_attempts=5)를 갖추고 있다. 그러나 **(i) LLM 생성 코드의 구조적 불안정성** — 에러 수정 루프에도 불구하고 CUDA 초기화 레이스 컨디션, 원격 환경 경로 불일치 등 환경 의존적 오류는 동일 패턴을 반복하여 35/35 실행 실패가 발생하였으며, **(ii) 성능 기반 자기 개선의 부재** — 코드가 정상 실행된 후에도 validation accuracy 등 metric을 참조하여 학습 전략을 개선하는 루프가 없어, "코드는 돌아가지만 성능이 낮다"는 상황에서 개선할 수 없다는 한계를 보인다.
+AutoML-Agent(ICML 2025)는 LLM 기반 multi-agent로 이를 통합 시도하며, 코드 실행 에러 시 error log를 LLM에 피드백하여 코드를 재생성하는 에러 수정 루프(n_attempts=5)를 갖추고 있다. 그러나 **(i) 실행 환경 적응의 취약성** — AutoML-Agent를 원래 설계된 로컬 환경이 아닌 원격 GPU(AWS EC2)에서 실행하기 위해 wrapper를 작성하였으나, 원격 SSH 실행 환경에서의 CUDA 초기화 호환성 문제로 35/35 실행이 실패하였다. LLM이 생성하는 `device = "cuda" if torch.cuda.is_available() else "cpu"` 관용 패턴이 wrapper의 GPU 검증 패치와 충돌하여 CUDA 초기화가 중복 호출되었으며, 에러 수정 루프(n_attempts=5)가 동일 패턴을 반복 생성하여 해결하지 못하였다. 이는 AutoML-Agent 자체의 결함이라기보다 **LLM 생성 코드가 실행 환경 변화에 적응하지 못하는 구조적 한계**를 보여준다. **(ii) 성능 기반 자기 개선의 부재** — 코드가 정상 실행된 후에도 validation accuracy 등 metric을 참조하여 학습 전략을 개선하는 루프가 없어, "코드는 돌아가지만 성능이 낮다"는 상황에서 개선할 수 없다는 한계를 보인다.
 
 ### 1.2 문제 정의: 세 단계의 자율화
 
@@ -286,14 +286,14 @@ train_worker의 result에 `applied_techniques` dict를 포함하여 **실제 적
 
 | 관점 | AutoML-Agent | Alchemist |
 |------|-------------|-----------|
-| 실행 방식 | LLM이 학습 코드 직접 생성 → 런타임 불안정(35/35 CUDA 실패) | Pre-validated train_worker + config 전달 → 코드 생성 불필요 |
+| 실행 방식 | LLM이 학습 코드 직접 생성 → 원격 환경 적응 실패(35/35 CUDA 초기화 충돌) | Pre-validated train_worker + config 전달 → 코드 생성 불필요, 환경 독립적 |
 | 성능 피드백 | ❌ 에러 수정만 (n_attempts=5, metric 미참조) | ✅ metric-driven self-refinement + SoTA gap 분석 |
 | 기법 탐색 | Plan에 기법 명시 가능하나, 생성 코드 품질에 의존 | 26-technique catalog → config로 자동 매핑 + closed-loop 검증 |
 | 모델 탐색 | LLM 내부 지식 기반 (외부 검증 없음) | 4-source retrieval (HF+PwC+GitHub+arXiv) + 실측 baseline 검증 |
 | 경험 학습 | ❌ 매 task fresh start | ✅ cross-task experience 누적 |
 | Compute 효율 | 코드 에러 시 재시도 반복 (동일 budget 소모) | Early-stop + adaptive tuning으로 hopeless trial 선제 종료 |
 
-> **주의**: AutoML-Agent의 plan 품질 자체는 우수하였다 (ConvNeXt-Base + LLRD 0.7 + Mixup 0.8 + EMA 등 적절한 조합 제안). 한계는 plan을 실행 가능한 코드로 안정적으로 변환하는 과정과, 실행 결과를 기반으로 plan을 개선하는 피드백 루프에 있다.
+> **주의**: AutoML-Agent의 plan 품질 자체는 우수하였다 (ConvNeXt-Base + LLRD 0.7 + Mixup 0.8 + EMA 등 적절한 조합 제안). 코드 실행 실패는 원격 환경 적응의 문제이며, 로컬 GPU에서는 정상 동작할 수 있다. Alchemist와의 핵심 차이는 (1) 코드 생성 vs pre-validated worker 방식의 환경 안정성, (2) 실행 후 metric 기반 자기 개선 유무에 있다.
 
 ---
 
@@ -339,13 +339,19 @@ Alchemist는 AutoML-Agent 대비 (1) 코드 안정성(pre-validated worker), (2)
 
 ## Appendix
 
-### A. AutoML-Agent 실패 분석
+### A. AutoML-Agent 실행 환경 적응 분석
 
-AutoML-Agent(Claude CLI + EC2 실행)의 CIFAR-100 실험에서:
-- 35/35 execute_script 호출이 CUDA assert 실패
-- 원인: LLM 생성 코드의 `device = "cuda" if torch.cuda.is_available() else "cpu"` 패턴이 원격 실행 환경에서 CUDA 초기화 레이스 컨디션 유발
-- code-level iteration(n_attempts=5)이 동일 패턴 반복 → 해결 불가
-- Plan 자체는 양호(ConvNeXt-Base + LLRD 0.7 + Mixup 0.8 + EMA 0.9999) → Hybrid 실험의 근거
+AutoML-Agent(ICML 2025)는 로컬 GPU 환경에서의 실행을 전제로 설계되었다. 본 실험에서는 공정한 비교를 위해 동일한 AWS EC2 GPU 환경(g5.2xlarge, A10G)에서 실행을 시도하였으며, 이를 위해 원격 SSH 실행 wrapper(`remote_execute_ec2.py`)를 작성하였다.
+
+**실험 결과:**
+- 35/35 execute_script 호출이 CUDA 초기화 충돌로 실패
+- **원인 분석**: LLM 생성 코드의 `device = "cuda" if torch.cuda.is_available() else "cpu"` 관용 패턴과, wrapper가 삽입한 GPU 검증 패치(`assert torch.cuda.is_available()`)가 원격 SSH 환경에서 CUDA 초기화를 중복 호출하여 충돌
+- code-level iteration(n_attempts=5)이 동일 관용 패턴을 반복 생성하여 해결 불가
+
+**주의사항:**
+- 이 실패는 **AutoML-Agent 자체의 결함이 아니라**, 원래 설계된 로컬 환경이 아닌 원격 실행 환경에서의 호환성 문제이다. 로컬 GPU 환경에서는 정상 동작할 수 있다.
+- 다만 이는 LLM 생성 코드 방식이 **실행 환경 변화에 취약**하다는 구조적 한계를 보여준다. Alchemist는 pre-validated worker + config 전달 방식으로 이 문제를 원천 회피한다.
+- Plan 자체는 양호하였다 (ConvNeXt-Base + LLRD 0.7 + Mixup 0.8 + EMA 0.9999) → Hybrid 실험의 근거로 활용
 
 ### B. EC2 비용 분석
 
