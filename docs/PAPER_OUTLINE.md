@@ -94,7 +94,7 @@ Benchmark 추천 "Astroformer" (PwC 93.4%, GitHub 코드 존재)
 
 1. **3-Agent 협업 하네스와 validate-fail-fallback 프로토콜**: Benchmark(4-source retrieval-grounded 탐색: HF Hub + PwC + GitHub + arXiv) → Controller(다중 registry 검증 + 실측 baseline 평가 + vision-aware 실시간 감시) → Research(자율 최적화)의 역할 분담과, 검증-실패-대안 탐색 루프에 의한 robust orchestration을 제안한다. Controller의 실측 검증(top-K baseline eval)과 실시간 감시(epoch-level early-stop, 40%+ compute 절감)가 LLM 추론의 한계를 empirical barrier로 보완한다.
 
-2. **Vision Technique Catalog + Closed-loop verification**: 26개 SoTA 비전 기법을 executable config로 매핑하고, 제안-실행 간 일치를 검증하는 피드백 루프를 구축하여 에이전트의 기법 적용 신뢰성을 보장한다.
+2. **Vision Technique Catalog + Architecture Module Injection + Closed-loop verification**: 26개 SoTA 비전 기법을 executable config로 매핑하고, 5종의 아키텍처 모듈(SE, CBAM, LoRA, Adapter, Self-Attention)을 아키텍처에 무관하게 자동 주입하는 NAS-like architecture search를 제공하며, 제안-실행 간 일치를 검증하는 피드백 루프를 구축하여 에이전트의 기법 적용 신뢰성을 보장한다.
 
 3. **Cross-task experience accumulation + adaptive tuning**: 실패 모드별 within-round config 자동 조정과, task 간 persistent memory 축적으로 에이전트가 점진적으로 비전 전문가로 성장한다.
 
@@ -173,16 +173,36 @@ SoTA 기법명 → concrete config override 매핑 사전:
 | Augmentation | mixup_light, cutmix, randaugment, random_erasing | `mixup_alpha=0.2, cutmix_alpha=1.0, ...` |
 | Regularization | stochastic_depth, label_smoothing, ema, llrd | `drop_path_rate=0.1, backbone_lr_scale=0.7` |
 | Schedule | cosine_restarts, onecycle, longer_training_30ep | `lr_schedule="cosine_restarts", epochs=30` |
-| Architecture | se_attention, cbam_attention | `add_se=True, add_attention=True` |
+| Architecture | se_attention, cbam_attention, lora_inject, adapter_inject, self_attention_2d | `add_se=True, add_cbam=True, add_lora=True, add_adapter=True` |
 
 `suggest_techniques()`가 catalog-driven(미시도 기법 자동 추출) + LLM-driven(catalog을 menu로 제시하여 조합 제안) 2-path 방식으로 config 생성.
 
-#### 2.4.5 Closed-Loop Technique Verification
-train_worker의 result에 `applied_techniques` dict를 포함하여 **실제 적용된 기법을 기록**. Research Agent가 매 trial 후 proposed config vs applied_techniques를 비교하여 silent drop(기법이 제안됐으나 실행 레이어에서 무시됨)을 감지.
+#### 2.4.5 Architecture-Agnostic Module Injection (NAS-like Architecture Search)
+
+Research Agent는 하이퍼파라미터 튜닝뿐 아니라 **모델 아키텍처 자체를 동적으로 변형**할 수 있다. `VisionArchModifier`가 **아키텍처에 무관하게** 임의의 timm 모델의 구조를 탐지하고, 적절한 위치에 학습 가능한 모듈을 자동 주입한다.
+
+**자동 구조 탐지:** `named_modules()`를 순회하여 Conv 스테이지(ResNet block, ConvNeXt block), Transformer 블록(ViT, SwinV2), Attention 프로젝션(qkv, proj) 위치를 자동 발견. 모델별 레이어 이름을 하드코딩하지 않으므로 **ResNet, ConvNeXt, SwinV2, ViT, MaxViT, EfficientNet 등 모든 timm 아키텍처에 범용 적용** 가능.
+
+**주입 가능한 모듈 (5종):**
+
+| 모듈 | 위치 | 효과 | 파라미터 오버헤드 |
+|------|------|------|:---:|
+| **SE (Squeeze-Excitation)** | Conv 스테이지 출력 | Channel attention으로 중요 feature 강조 | ~0.1% |
+| **CBAM** | Conv 스테이지 출력 | Channel + Spatial dual attention | ~0.2% |
+| **LoRA** | Transformer attention qkv/proj | Low-rank adaptation, 소수 파라미터로 fine-tuning | ~0.5% |
+| **Adapter** | Transformer 블록 사이 | Bottleneck MLP으로 task-specific 표현 학습 | ~1% |
+| **Self-Attention 2D** | Conv 스테이지 사이 | CNN에 global context 추가 (non-local block) | ~1% |
+
+**NAS와의 차이점:** 전통 NAS가 수천 개 후보 아키텍처를 처음부터 학습하는 것과 달리, Alchemist의 접근은 **(1) pretrained backbone을 유지하면서 (2) 소수의 학습 가능한 모듈만 주입**하여 transfer learning 문맥에서 아키텍처를 개선한다. Research Agent가 이전 trial 결과를 바탕으로 "SE가 효과적이었으니 CBAM도 시도" 또는 "LoRA rank를 높여보자" 같은 **metric-driven architecture decision**을 내린다는 점에서, 검색 공간을 지능적으로 탐색하는 NAS의 정신을 계승한다.
+
+**구현:** train_worker.py의 `apply_arch_modifications(model, config)`가 config에 명시된 모듈을 자동 주입하며, 주입 전후의 파라미터 수 · 주입된 모듈 수를 로깅하여 Research Agent의 closed-loop verification에 포함된다.
+
+#### 2.4.6 Closed-Loop Technique Verification
+train_worker의 result에 `applied_techniques` dict를 포함하여 **실제 적용된 기법을 기록**. Research Agent가 매 trial 후 proposed config vs applied_techniques를 비교하여 silent drop(기법이 제안됐으나 실행 레이어에서 무시됨)을 감지. Architecture module injection(SE, LoRA 등)도 동일하게 주입 전후 파라미터 수 변화로 검증.
 
 이전 실험에서 suggest_techniques가 `optimizer="sam"`을 제안했으나 train_worker에 SAM 미구현으로 silent AdamW fallback → **agent가 "SAM 적용" 착각** 문제를 이 메커니즘으로 해결.
 
-#### 2.4.6 Cross-Task Experience Store
+#### 2.4.7 Cross-Task Experience Store
 `VisionExperienceStore`가 완료된 task의 winning config · techniques · score를 persistent JSONL에 기록. 다음 task 시작 시 `retrieve_similar(task_name, num_classes, top_k=3)`로 유사 경험을 검색하여 `search_sota()` 프롬프트의 "Prior experience" 섹션에 주입.
 
 **유사도 메트릭**: num_classes bucket(tiny/small/medium/large) × keyword Jaccard (task name + description).
@@ -303,7 +323,7 @@ A10G에서 fp16 autocast는 10 epoch 이상의 장기 학습에서 activation ov
 - **LLM 타임아웃**: Claude CLI 120초 제한으로 suggest_techniques가 자주 fallback 의존. Async LLM call 또는 batch reasoning으로 개선 가능.
 - **단일 GPU 제약**: A10G 24GB에서 ViT-Large 이상 모델은 batch=8 이하로 제한. Multi-GPU 또는 gradient accumulation 통합 필요.
 - **Experience store 유사도**: 현재 keyword Jaccard + num_classes bucket으로 단순. Task embedding 기반 유사도로 정교화 가능.
-- **Architecture search 미통합**: 현재 Benchmark Agent가 선택한 단일 아키텍처를 최적화. 복수 아키텍처 병렬 탐색으로 확장 가능.
+- **Architecture search 확장**: 현재 VisionArchModifier를 통한 모듈 주입(SE, CBAM, LoRA, Adapter, Self-Attention)으로 pretrained backbone 위에서의 아키텍처 변형이 가능하나, backbone 자체의 depth/width 변경이나 복수 아키텍처 병렬 탐색으로 확장 가능.
 
 ---
 

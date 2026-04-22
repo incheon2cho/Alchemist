@@ -257,10 +257,28 @@ def load_vjepa2(
     logger.info("[V-JEPA2] Loading %s from HuggingFace...", hf_id)
 
     # Try torch.hub first (lighter dependency)
+    # Note: V-JEPA2 hub returns (encoder, predictor) tuple — take encoder only
     try:
-        model = torch.hub.load('facebookresearch/vjepa2', variant.replace(".", ""), pretrained=pretrained)
+        hub_name = variant.replace(".", "_").replace("vjepa2_", "vjepa2_vit_").replace("vjepa2_1_", "vjepa2_1_vit_")
+        # Normalize: vjepa2_vitl -> vjepa2_vit_large, etc.
+        name_map = {
+            "vjepa2_vit_vitl": "vjepa2_vit_large", "vjepa2_vit_vitb": "vjepa2_vit_base",
+            "vjepa2_vit_vitg": "vjepa2_vit_giant", "vjepa2_vit_vitG": "vjepa2_vit_giant",
+            "vjepa2_vit_vith": "vjepa2_vit_huge",
+            "vjepa2_1_vit_vitl": "vjepa2_1_vit_large_384",
+            "vjepa2_1_vit_vitb": "vjepa2_1_vit_base_384",
+            "vjepa2_1_vit_vitg": "vjepa2_1_vit_giant_384",
+            "vjepa2_1_vit_vitG": "vjepa2_1_vit_gigantic_384",
+        }
+        hub_name = name_map.get(hub_name, hub_name)
+        result = torch.hub.load('facebookresearch/vjepa2', hub_name, pretrained=pretrained)
+        # Hub returns (encoder, predictor) tuple — extract encoder
+        if isinstance(result, tuple):
+            model = result[0]
+        else:
+            model = result
         embed_dim = getattr(model, "embed_dim", 1024)
-        logger.info("[V-JEPA2] Loaded via torch.hub (embed_dim=%d)", embed_dim)
+        logger.info("[V-JEPA2] Loaded via torch.hub: %s (embed_dim=%d)", hub_name, embed_dim)
     except Exception as hub_err:
         logger.info("[V-JEPA2] torch.hub failed (%s), trying HuggingFace transformers...", hub_err)
         try:

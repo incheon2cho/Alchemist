@@ -354,16 +354,46 @@ def load_vision_encoder(variant: str = "vjepa2.1_vitg", device="cuda"):
         logger.info("Vision encoder: DUMMY (embed_dim=1408, for pipeline testing)")
         return model, 1408
 
-    try:
-        from vjepa_loader import load_vjepa2
-    except ImportError:
-        from alchemist.core.vjepa_loader import load_vjepa2
+    # Try torch.hub direct loading (most reliable for V-JEPA2)
+    hub_name_map = {
+        "vjepa2_vitl": "vjepa2_vit_large", "vjepa2_vitb": "vjepa2_vit_base",
+        "vjepa2_vitg": "vjepa2_vit_giant", "vjepa2_vith": "vjepa2_vit_huge",
+        "vjepa2.1_vitl": "vjepa2_1_vit_large_384", "vjepa2.1_vitb": "vjepa2_1_vit_base_384",
+        "vjepa2.1_vitg": "vjepa2_1_vit_giant_384", "vjepa2.1_vitG": "vjepa2_1_vit_gigantic_384",
+    }
+    hub_name = hub_name_map.get(variant, variant)
 
-    model = load_vjepa2(variant, num_classes=0, pretrained=True, for_vlm=True)
-    embed_dim = model.embed_dim
-    model = model.to(device)
-    model.eval()
-    logger.info("Vision encoder: %s (embed_dim=%d, frozen)", variant, embed_dim)
+    try:
+        # Fix localhost URL if needed
+        import pathlib
+        hub_backbones = pathlib.Path.home() / ".cache/torch/hub/facebookresearch_vjepa2_main/src/hub/backbones.py"
+        if hub_backbones.exists():
+            content = hub_backbones.read_text()
+            if "localhost:8300" in content:
+                content = content.replace(
+                    'VJEPA_BASE_URL = "http://localhost:8300"',
+                    'VJEPA_BASE_URL = "https://dl.fbaipublicfiles.com/vjepa2"',
+                )
+                hub_backbones.write_text(content)
+                logger.info("  Fixed V-JEPA2 weight URL to dl.fbaipublicfiles.com")
+
+        result = torch.hub.load('facebookresearch/vjepa2', hub_name, pretrained=True)
+        model = result[0] if isinstance(result, tuple) else result
+        embed_dim = getattr(model, "embed_dim", 1024)
+    except Exception as e:
+        logger.warning("torch.hub failed: %s, trying vjepa_loader...", e)
+        try:
+            from vjepa_loader import load_vjepa2
+        except ImportError:
+            from alchemist.core.vjepa_loader import load_vjepa2
+        model = load_vjepa2(variant, num_classes=0, pretrained=True, for_vlm=True)
+        embed_dim = model.embed_dim
+
+    model = model.to(device).eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    logger.info("Vision encoder: %s (embed_dim=%d, frozen, GPU=%.1fGB)",
+                variant, embed_dim, torch.cuda.memory_allocated() / 1e9)
     return model, embed_dim
 
 
@@ -666,35 +696,49 @@ def run_vlm_eval(
     """Evaluate on Video-MME-v2 multiple-choice QA."""
     model.eval()
 
-    # Load eval data
-    try:
-        from datasets import load_dataset
-        eval_ds = load_dataset(eval_path, split="test")
-    except Exception:
-        if os.path.exists(eval_path):
-            import pandas as pd
-            eval_ds = pd.read_parquet(eval_path).to_dict("records")
-        else:
-            logger.warning("Cannot load eval dataset: %s", eval_path)
-            return 0.0
+    # Load eval data (JSON or parquet)
+    eval_ds = None
+    if os.path.exists(eval_path) and eval_path.endswith(".json"):
+        with open(eval_path) as f:
+            eval_ds = json.load(f)
+    else:
+        try:
+            from datasets import load_dataset
+            eval_ds = list(load_dataset(eval_path, split="test"))
+        except Exception:
+            pass
+    if not eval_ds:
+        logger.warning("Cannot load eval dataset: %s", eval_path)
+        return 0.0
+
+    # Resolve video directory (same parent as eval file)
+    eval_video_dir = os.path.join(os.path.dirname(eval_path), "videos")
 
     correct = total = 0
+    skipped = 0
     image_token_id = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
 
     for sample in eval_ds:
-        video_path = sample.get("video_path", sample.get("video_id", ""))
+        video_id = sample.get("video_id", "")
         question = sample.get("question", "")
         options = sample.get("options", "")
         answer = sample.get("answer", "")
 
-        if not video_path or not question:
+        if not question:
+            continue
+
+        # Resolve video path: try video_dir/video_id.mp4
+        video_file = os.path.join(eval_video_dir, f"{video_id}.mp4")
+        if not os.path.exists(video_file):
+            skipped += 1
             continue
 
         # Load video
         try:
-            video = load_video_frames(video_path, num_frames, img_size)
+            video = load_video_frames(video_file, num_frames, img_size)
             video = video.unsqueeze(0).to(device)  # (1, C, T, H, W)
         except Exception:
+            skipped += 1
             continue
 
         # Build prompt
@@ -726,11 +770,13 @@ def run_vlm_eval(
         except Exception:
             continue
 
-        if total >= 100:  # Quick eval on subset
-            break
+        if total % 50 == 0 and total > 0:
+            logger.info("  [eval] %d/%d correct so far (%.1f%%), skipped=%d",
+                        correct, total, 100.0 * correct / total, skipped)
 
     accuracy = 100.0 * correct / max(total, 1)
-    logger.info("  Video-MME eval: %d/%d correct (%.2f%%)", correct, total, accuracy)
+    logger.info("  Video-MME eval: %d/%d correct (%.2f%%), %d skipped (no video)",
+                correct, total, accuracy, skipped)
     return accuracy
 
 
