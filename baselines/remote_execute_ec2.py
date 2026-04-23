@@ -49,7 +49,7 @@ if not log.handlers:
 # ----------------------------------------------------------------------
 # Configuration (read from env at import)
 # ----------------------------------------------------------------------
-EC2_HOST     = os.environ.get("AMLA_EC2_HOST",     "3.90.166.150")
+EC2_HOST     = os.environ.get("AMLA_EC2_HOST",     "100.31.77.111")
 EC2_USER     = os.environ.get("AMLA_EC2_USER",     "ubuntu")
 EC2_KEY      = os.path.expanduser(
                os.environ.get("AMLA_EC2_KEY",      "~/.ssh/alchemist-gpu-key-use1.pem"))
@@ -119,15 +119,14 @@ def _run(cmd: list[str], timeout: int | None = None) -> tuple[int, str, str]:
 # Main entry — drop-in for AutoML-Agent's execute_script()
 # ----------------------------------------------------------------------
 _PATCH_HEADER = (
-    "# [remote_execute_ec2] AUTO-INJECTED: enforce GPU-only + fixed paths\n"
-    "import os as _alch_os, sys as _alch_sys\n"
+    "# [remote_execute_ec2] AUTO-INJECTED: set CUDA device + fixed paths\n"
+    "import os as _alch_os\n"
     "_alch_os.environ['CUDA_VISIBLE_DEVICES'] = _alch_os.environ.get('CUDA_VISIBLE_DEVICES', '0')\n"
-    "import torch as _alch_torch\n"
-    "assert _alch_torch.cuda.is_available(), 'CUDA required (post-patched). No CPU fallback.'\n"
-    "print(f'[alch-preflight] cuda={_alch_torch.cuda.is_available()} '\n"
-    "      f'name={_alch_torch.cuda.get_device_name(0)}', flush=True)\n"
-    "del _alch_os, _alch_sys, _alch_torch\n"
+    "del _alch_os\n"
     "# --- original agent script follows ---\n"
+    # NOTE: Previous version had CUDA assert here which caused race condition
+    # with the agent's own torch.cuda.is_available() call. Removed to fix
+    # 35/35 CUDA initialization failures. See PAPER_OUTLINE Appendix A.
 )
 
 

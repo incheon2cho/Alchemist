@@ -151,6 +151,8 @@ class AWSExecutor(TrainingExecutor):
             return "vlm_worker.py"
         if task_name in ("ucf101", "hmdb51", "kinetics", "ssv2", "diving48"):
             return "video_worker.py"
+        if task_name in ("coco", "coco_detection", "voc", "objects365"):
+            return "detection_worker.py"
         return "train_worker.py"
 
     def _ssh_cmd(self, command: str, timeout: int | None = None) -> subprocess.CompletedProcess:

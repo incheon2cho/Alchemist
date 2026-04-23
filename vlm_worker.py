@@ -597,9 +597,10 @@ def run_vlm_training(
         num_visual_tokens=num_output_tokens,
     )
 
+    num_workers = config.get("num_workers", 4)
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=batch_size, shuffle=True,
-        num_workers=2, pin_memory=True, drop_last=True,
+        num_workers=num_workers, pin_memory=True, drop_last=True,
     )
 
     # 6. Optimizer (only trainable params: C-Abstractor + LoRA)
@@ -909,6 +910,12 @@ def run_vlm_eval(
             if is_correct:
                 qtype_stats[qtype]["correct"] += 1
 
+            # Track by task_type × duration (cross analysis)
+            cross_key = f"{qtype}|{duration}"
+            qtype_stats[cross_key]["total"] += 1
+            if is_correct:
+                qtype_stats[cross_key]["correct"] += 1
+
             # Track by domain
             domain = sample.get("domain", "") or "unknown"
             duration_stats[f"domain:{domain}"]["total"] += 1
@@ -934,10 +941,32 @@ def run_vlm_eval(
         logger.info("    %s: %d/%d = %.1f%%", dur, s["correct"], s["total"], acc)
 
     logger.info("  === Task Type Breakdown (12 types) ===")
-    sorted_types = sorted(qtype_stats.items(), key=lambda x: -x[1]["total"])
-    for qt, s in sorted_types:
+    # Get unique task types (exclude cross keys with |)
+    task_types = sorted([k for k in qtype_stats.keys() if "|" not in k])
+    for qt in task_types:
+        s = qtype_stats[qt]
         acc = 100.0 * s["correct"] / max(s["total"], 1)
         logger.info("    %-25s: %d/%d = %.1f%%", qt, s["correct"], s["total"], acc)
+
+    # Cross analysis: Task Type × Duration
+    logger.info("  === Task Type × Duration (12 × 3 cross table) ===")
+    header = f"    {'Task Type':25s} | {'Short':>8s} | {'Medium':>8s} | {'Long':>8s} | {'Overall':>8s}"
+    logger.info(header)
+    logger.info("    " + "-" * 70)
+    for qt in task_types:
+        parts = []
+        for dur in ["short", "medium", "long"]:
+            cross_key = f"{qt}|{dur}"
+            s = qtype_stats.get(cross_key, {"correct": 0, "total": 0})
+            if s["total"] > 0:
+                acc = 100.0 * s["correct"] / s["total"]
+                parts.append(f"{acc:>7.1f}%")
+            else:
+                parts.append(f"{'N/A':>8s}")
+        overall = qtype_stats.get(qt, {"correct": 0, "total": 0})
+        ov_acc = 100.0 * overall["correct"] / max(overall["total"], 1)
+        parts.append(f"{ov_acc:>7.1f}%")
+        logger.info(f"    {qt:25s} | {parts[0]} | {parts[1]} | {parts[2]} | {parts[3]}")
 
     logger.info("  === Domain Breakdown ===")
     for key in sorted(duration_stats.keys()):
