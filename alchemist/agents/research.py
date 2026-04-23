@@ -396,6 +396,97 @@ class SelfEvolutionEngine:
 
         return configs[:n_configs]
 
+    def evolve_with_external_knowledge(
+        self,
+        llm: Any,
+        task: Any,
+        current_best: float,
+        catalog: dict,
+        trial_history: list[dict],
+    ) -> list[dict]:
+        """Evolve configs by combining internal experience + external SoTA knowledge.
+
+        Uses LLM to:
+        1. Analyze what worked/failed from trial history
+        2. Search external knowledge for techniques not yet tried
+        3. Generate new technique configs that bridge the gap to SoTA
+        4. Auto-add discovered techniques to the catalog
+
+        Returns: list of evolved config dicts
+        """
+        # Build internal experience summary
+        ranking = self.get_priority_ranking()
+        top_techs = ", ".join(f"{n}({d:+.1f})" for n, d in ranking[:5]) if ranking else "none yet"
+        failed_techs = ", ".join(f"{n}({d:+.1f})" for n, d in ranking[-3:] if d < 0) if ranking else "none"
+
+        trial_summary = ""
+        for t in trial_history[-5:]:
+            trial_summary += (
+                f"  - {t.get('config', {}).get('base_model', '?')}: "
+                f"mAP={t.get('map50_95', t.get('score', 0)):.1f}%, "
+                f"techniques={t.get('applied_techniques', {})}\n"
+            )
+
+        prompt = (
+            f"You are a detection research agent analyzing experiment results.\n\n"
+            f"## Task: {task.name if hasattr(task, 'name') else task}\n"
+            f"## Current best: {current_best:.2f}%\n"
+            f"## SoTA reference: YOLOv8x=53.9%, YOLO11x=54.7%, RT-DETRv4-X=57.0%\n\n"
+            f"## Internal experience:\n"
+            f"Top effective techniques: {top_techs}\n"
+            f"Techniques that hurt: {failed_techs}\n\n"
+            f"## Recent trials:\n{trial_summary}\n"
+            f"## Available catalog techniques (not yet fully explored):\n"
+            f"{', '.join(list(catalog.keys())[:30])}\n\n"
+            f"## Instructions:\n"
+            f"1. Analyze the gap between current best ({current_best:.1f}%) and SoTA.\n"
+            f"2. Identify 3-5 specific techniques from recent papers/literature that could help:\n"
+            f"   - Consider: model architecture changes, augmentation strategies,\n"
+            f"     optimizer tuning, loss function adjustments, training schedule.\n"
+            f"3. For EACH technique, provide a concrete config override as JSON.\n"
+            f"4. Prioritize techniques NOT yet tried in our experiments.\n\n"
+            f"Respond with JSON array of objects:\n"
+            f"[{{"
+            f'"name": "technique_name", '
+            f'"reason": "why this helps", '
+            f'"config": {{"key": "value", ...}}'
+            f"}}]\n"
+            f"Be specific with numerical values. Use ultralytics config keys."
+        )
+
+        try:
+            from alchemist.core.llm import safe_llm_call
+            result = safe_llm_call(
+                llm, prompt,
+                fallback=[{
+                    "name": "coco_optimal_v11m",
+                    "reason": "YOLO11m has better small-object detection than v8m",
+                    "config": catalog.get("coco_optimal_v11m", {}),
+                }],
+            )
+
+            configs = []
+            if isinstance(result, list):
+                for item in result:
+                    name = item.get("name", "")
+                    config = item.get("config", {})
+                    reason = item.get("reason", "")
+
+                    if config:
+                        configs.append(config)
+                        logger.info("[evolution-external] LLM suggested: %s — %s", name, reason)
+
+                        # Auto-add to catalog if new
+                        if name and name not in catalog:
+                            catalog[name] = config
+                            logger.info("[evolution-external] New technique added to catalog: %s", name)
+
+            return configs
+
+        except Exception as e:
+            logger.warning("[evolution-external] LLM call failed: %s, using fallback", e)
+            return [catalog.get("coco_optimal_v11m", {})]
+
     def summarize(self) -> str:
         """Human-readable evolution summary."""
         lines = [f"=== Evolution Engine (Gen {self.generation}) ==="]
