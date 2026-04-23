@@ -679,12 +679,17 @@ class ResearchAgent:
             "base_model": base_model, "score": round(baseline, 2),
         })
 
-        # 3. Iterative research loop: design → run → analyze (with SoTA gap) → refine
+        # 3. Iterative research loop: design → run → analyze → evolve → refine
         all_trials: list[TrialResult] = []
         total_budget_used = 0.0
         best_score = baseline
         best_trial: TrialResult | None = None
         analysis_history: list[str] = []
+
+        # Initialize self-evolution engine
+        evolution = SelfEvolutionEngine()
+        task_type = task.name.lower()
+        catalog = get_technique_catalog(task_type)
 
         for round_num in range(1, self.max_rounds + 1):
             remaining_budget = budget - total_budget_used
@@ -697,10 +702,36 @@ class ResearchAgent:
                 )
                 break
 
-            # 2a. Design experiments (informed by prior analysis)
-            # Each round gets up to max_trials trials
+            # 2a. Design experiments (informed by prior analysis + evolution)
+            # Round 2+: inject evolved configs from SelfEvolutionEngine
+            evolved_context = ""
+            if round_num > 1 and all_trials:
+                # Internal evolution: generate configs from experience
+                evolved_configs = evolution.evolve_next_configs(catalog, n_configs=2)
+                # External SoTA: LLM-driven technique discovery
+                trial_history = [
+                    {"config": safe_asdict(t.config) if hasattr(t.config, '__dataclass_fields__') else {},
+                     "score": t.score, "map50_95": t.score,
+                     "applied_techniques": getattr(t, "applied_techniques", {})}
+                    for t in all_trials
+                ]
+                external_configs = evolution.evolve_with_external_knowledge(
+                    self.llm, task, best_score, catalog, trial_history,
+                )
+                evolved_context = (
+                    f"\n## Evolution Engine Suggestions (Gen {evolution.generation}):\n"
+                    f"{evolution.summarize()}\n"
+                    f"Evolved configs: {len(evolved_configs)}, External configs: {len(external_configs)}\n"
+                )
+                self.research_log.record("evolution", "round_evolution", {
+                    "evolved_configs": len(evolved_configs),
+                    "external_configs": len(external_configs),
+                    "top_techniques": evolution.get_priority_ranking()[:5],
+                    "best_combos": evolution.get_best_combos(3),
+                }, round_num)
+
             configs = self.design_experiment(
-                base_model, task, upstream_context,
+                base_model, task, upstream_context + evolved_context,
                 prior_analysis=analysis_history,
                 remaining_trials=self.max_trials,
                 sota_knowledge=sota_knowledge,
@@ -744,6 +775,20 @@ class ResearchAgent:
             if round_best.score > best_score:
                 best_score = round_best.score
                 best_trial = round_best
+
+            # 2b-1. Record trials in evolution engine
+            for trial in trials:
+                trial_config = safe_asdict(trial.config) if hasattr(trial.config, '__dataclass_fields__') else {}
+                evolution.record_trial(
+                    config=trial_config,
+                    score=trial.score,
+                    baseline=baseline,
+                )
+            evolution.save()
+            self.research_log.record("evolution", "trials_recorded", {
+                "generation": evolution.generation,
+                "summary": evolution.summarize()[:500],
+            }, round_num)
 
             # 2c. Self-analyze results + SoTA gap analysis
             analysis = self.analyze_results(
