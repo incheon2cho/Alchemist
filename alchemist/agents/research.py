@@ -95,6 +95,108 @@ VISION_TECHNIQUE_CATALOG: dict[str, dict] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Detection Technique Catalog — YOLO/RT-DETR object detection
+# ---------------------------------------------------------------------------
+
+DETECTION_TECHNIQUE_CATALOG: dict[str, dict] = {
+    # --- Model Architecture ---
+    "yolov8n":              {"base_model": "yolov8n", "batch_size": 32},
+    "yolov8s":              {"base_model": "yolov8s", "batch_size": 32},
+    "yolov8m":              {"base_model": "yolov8m", "batch_size": 16},
+    "yolov8l":              {"base_model": "yolov8l", "batch_size": 8},
+    "yolov8x":              {"base_model": "yolov8x", "batch_size": 4},
+    "yolo11n":              {"base_model": "yolo11n", "batch_size": 32},
+    "yolo11s":              {"base_model": "yolo11s", "batch_size": 32},
+    "yolo11m":              {"base_model": "yolo11m", "batch_size": 16},
+    "yolo11l":              {"base_model": "yolo11l", "batch_size": 8},
+    "rtdetr_l":             {"base_model": "rtdetr-l", "batch_size": 8},
+    "rtdetr_x":             {"base_model": "rtdetr-x", "batch_size": 4},
+
+    # --- Augmentation ---
+    "mosaic_on":            {"extra": {"mosaic": 1.0}},
+    "mosaic_off":           {"extra": {"mosaic": 0.0}},
+    "mixup_det":            {"extra": {"mixup": 0.15}},
+    "mixup_det_strong":     {"extra": {"mixup": 0.3}},
+    "copy_paste":           {"extra": {"copy_paste": 0.1}},
+    "copy_paste_strong":    {"extra": {"copy_paste": 0.3}},
+    "multi_scale":          {"extra": {"multi_scale": 0.5}},
+    "random_erasing_det":   {"extra": {"erasing": 0.4}},
+    "hsv_augment":          {"extra": {"hsv_h": 0.015, "hsv_s": 0.7, "hsv_v": 0.4}},
+    "geometric_augment":    {"extra": {"degrees": 10.0, "translate": 0.1, "scale": 0.5, "fliplr": 0.5}},
+
+    # --- Resolution ---
+    "resolution_640":       {"img_size": 640},
+    "resolution_800":       {"img_size": 800},
+    "resolution_1280":      {"img_size": 1280},
+
+    # --- Optimizer ---
+    "sgd_optimizer":        {"extra": {"optimizer": "SGD"}},
+    "adamw_optimizer":      {"extra": {"optimizer": "AdamW"}},
+    "lr_high":              {"lr": 0.02},
+    "lr_low":               {"lr": 0.005},
+    "lr_very_low":          {"lr": 0.001},
+    "weight_decay_det":     {"weight_decay": 0.0005},
+    "weight_decay_strong":  {"weight_decay": 0.001},
+    "warmup_long":          {"extra": {"warmup_epochs": 5.0}},
+    "warmup_short":         {"extra": {"warmup_epochs": 1.0}},
+
+    # --- Loss Tuning ---
+    "box_loss_high":        {"extra": {"box": 10.0}},
+    "box_loss_low":         {"extra": {"box": 5.0}},
+    "cls_loss_high":        {"extra": {"cls": 1.0}},
+    "cls_loss_low":         {"extra": {"cls": 0.3}},
+    "dfl_loss_high":        {"extra": {"dfl": 2.0}},
+
+    # --- NMS Tuning ---
+    "nms_iou_tight":        {"extra": {"iou": 0.6}},
+    "nms_iou_loose":        {"extra": {"iou": 0.8}},
+    "nms_conf_low":         {"extra": {"conf": 0.001}},
+    "nms_conf_high":        {"extra": {"conf": 0.01}},
+
+    # --- Training Duration ---
+    "short_training":       {"epochs": 30, "extra": {"patience": 10}},
+    "standard_training":    {"epochs": 50, "extra": {"patience": 10}},
+    "long_training":        {"epochs": 100, "extra": {"patience": 20}},
+    "very_long_training":   {"epochs": 200, "extra": {"patience": 30}},
+
+    # --- Backbone Freeze ---
+    "freeze_backbone_10":   {"extra": {"freeze": 10}},
+    "freeze_backbone_15":   {"extra": {"freeze": 15}},
+
+    # --- Close Mosaic ---
+    "close_mosaic_early":   {"extra": {"close_mosaic": 5}},
+    "close_mosaic_late":    {"extra": {"close_mosaic": 15}},
+
+    # --- Cosine LR ---
+    "cosine_lr":            {"extra": {"cos_lr": True}},
+
+    # --- Mosaic-9 (small object boost) ---
+    "mosaic9_small_obj":    {"extra": {"mosaic": 1.0, "copy_paste": 0.2}, "img_size": 1280},
+
+    # --- Bayesian-tuned loss (literature optimal) ---
+    "bayesian_loss_tune":   {"extra": {"box": 18.28, "cls": 1.33, "dfl": 0.56}},
+
+    # --- Combined best practices ---
+    "coco_optimal_v8m":     {"base_model": "yolov8m", "epochs": 100, "batch_size": 16,
+                             "img_size": 640, "lr": 0.01,
+                             "extra": {"mosaic": 0.43, "patience": 20, "cos_lr": True}},
+    "coco_optimal_v11m":    {"base_model": "yolo11m", "epochs": 100, "batch_size": 16,
+                             "img_size": 640, "lr": 0.01,
+                             "extra": {"mosaic": 1.0, "patience": 20, "cos_lr": True}},
+    "coco_optimal_rtdetr":  {"base_model": "rtdetr-l", "epochs": 100, "batch_size": 8,
+                             "img_size": 640, "lr": 0.001,
+                             "extra": {"optimizer": "AdamW", "patience": 20}},
+}
+
+
+def get_technique_catalog(task_type: str = "classification") -> dict[str, dict]:
+    """Return the appropriate technique catalog based on task type."""
+    if task_type in ("detection", "coco_detection", "object_detection"):
+        return DETECTION_TECHNIQUE_CATALOG
+    return VISION_TECHNIQUE_CATALOG
+
+
 class ResearchLog:
     """Research Agent의 전체 연구 과정을 기록하는 로그.
 
@@ -859,37 +961,56 @@ class ResearchAgent:
                 if tech_name.lower() in combined.lower():
                     tried_techniques.add(tech_name)
 
+        # Select appropriate catalog based on task type
+        task_type = task.name.lower() if task else ""
+        is_detection = any(k in task_type for k in ("detection", "coco", "voc", "objects365"))
+        catalog = DETECTION_TECHNIQUE_CATALOG if is_detection else VISION_TECHNIQUE_CATALOG
+
         # Untried techniques from catalog
-        untried = {k: v for k, v in VISION_TECHNIQUE_CATALOG.items()
+        for tech_name in catalog:
+            if tech_name.lower() in combined.lower():
+                tried_techniques.add(tech_name)
+
+        untried = {k: v for k, v in catalog.items()
                    if k not in tried_techniques}
         logger.info(
-            "Technique catalog: %d total, %d tried, %d untried",
-            len(VISION_TECHNIQUE_CATALOG), len(tried_techniques), len(untried),
+            "Technique catalog (%s): %d total, %d tried, %d untried",
+            "detection" if is_detection else "classification",
+            len(catalog), len(tried_techniques), len(untried),
         )
 
         # 2. Compose concrete configs from untried techniques
-        # Strategy: take the best-performing base config (lr=1e-4 or 3e-4,
-        # unfreeze, batch=32) and layer untried techniques on top.
-        base_config = {
-            "lr": 1e-4, "batch_size": 32, "epochs": 20,
-            "freeze_backbone": False, "adapter": "linear_head",
-            "optimizer": "sam", "sam_rho": 0.05,
-            "mixup": True, "mixup_alpha": 0.3,
-            "cutmix": True, "cutmix_alpha": 0.5,
-            "randaugment": True, "label_smoothing": 0.1,
-            "ema": True, "ema_decay": 0.9999,
-            "warmup_epochs": 2, "backbone_lr_scale": 0.7,
-            "weight_decay": 0.02,
-        }
+        if is_detection:
+            base_config = {
+                "base_model": "yolov8m", "batch_size": 16, "epochs": 50,
+                "img_size": 640, "lr": 0.01, "optimizer": "auto",
+                "augmentation": "advanced", "patience": 10,
+                "device": "0", "workers": 4,
+            }
+            priority_techs = [
+                "yolo11m", "rtdetr_l", "resolution_800",
+                "long_training", "copy_paste", "mixup_det",
+                "lr_low", "freeze_backbone_10", "multi_scale",
+            ]
+        else:
+            base_config = {
+                "lr": 1e-4, "batch_size": 32, "epochs": 20,
+                "freeze_backbone": False, "adapter": "linear_head",
+                "optimizer": "sam", "sam_rho": 0.05,
+                "mixup": True, "mixup_alpha": 0.3,
+                "cutmix": True, "cutmix_alpha": 0.5,
+                "randaugment": True, "label_smoothing": 0.1,
+                "ema": True, "ema_decay": 0.9999,
+                "warmup_epochs": 2, "backbone_lr_scale": 0.7,
+                "weight_decay": 0.02,
+            }
+            priority_techs = [
+                "stochastic_depth", "random_erasing", "sam_aggressive",
+                "cosine_restarts", "longer_training_30ep",
+                "stochastic_depth_strong", "se_attention",
+            ]
 
         configs = []
-
-        # Priority untried techniques (ordered by expected impact)
-        priority_techs = [
-            "stochastic_depth", "random_erasing", "sam_aggressive",
-            "cosine_restarts", "longer_training_30ep",
-            "stochastic_depth_strong", "se_attention",
-        ]
         for tech_name in priority_techs:
             if tech_name in untried and len(configs) < 5:
                 cfg = {**base_config}
@@ -1146,6 +1267,87 @@ class ResearchAgent:
                 logger.info("[adapt] batch_size %d → 64 (gradient stability for long FT)",
                             adapted.batch_size)
                 adapted = replace(adapted, batch_size=64)
+        return adapted
+
+    def _adapt_detection_from_results(
+        self,
+        config: dict,
+        trial_results: list[dict],
+    ) -> dict:
+        """Detection-specific self-refinement based on trial results.
+
+        Analyzes mAP, precision, recall patterns and adjusts config accordingly.
+        """
+        if not trial_results:
+            return config
+
+        adapted = dict(config)
+        last = trial_results[-1]
+        best = max(trial_results, key=lambda r: r.get("map50_95", 0))
+
+        map50_95 = last.get("map50_95", 0)
+        map50 = last.get("map50", 0)
+        precision = last.get("precision", 0)
+        recall = last.get("recall", 0)
+
+        logger.info("[det-refine] Last: mAP50-95=%.1f, mAP50=%.1f, P=%.1f, R=%.1f",
+                    map50_95, map50, precision, recall)
+
+        # Low recall + high precision → model is too conservative
+        if recall < 60 and precision > 70:
+            logger.info("[det-refine] Low recall (%.1f%%), high precision → increase recall", recall)
+            adapted["extra"] = adapted.get("extra", {})
+            adapted["extra"]["conf"] = 0.15  # lower confidence threshold
+            adapted["extra"]["cls"] = max(0.3, adapted["extra"].get("cls", 0.5) - 0.2)
+            adapted["extra"]["mixup"] = 0.2  # add diversity
+
+        # High recall + low precision → too many false positives
+        elif precision < 50 and recall > 60:
+            logger.info("[det-refine] High recall (%.1f%%), low precision → reduce FP", precision)
+            adapted["extra"] = adapted.get("extra", {})
+            adapted["extra"]["conf"] = 0.35
+            adapted["extra"]["cls"] = min(2.0, adapted["extra"].get("cls", 0.5) + 0.5)
+
+        # Low mAP overall → need more capacity or training
+        if map50_95 < 40:
+            logger.info("[det-refine] Low mAP (%.1f%%) → increase capacity", map50_95)
+            # Try larger model
+            model_upgrade = {
+                "yolov8n": "yolov8s", "yolov8s": "yolov8m",
+                "yolov8m": "yolov8l", "yolov8l": "yolov8x",
+                "yolo11n": "yolo11s", "yolo11s": "yolo11m",
+                "yolo11m": "yolo11l", "yolo11l": "yolo11x",
+            }
+            current_model = adapted.get("base_model", "yolov8m")
+            if current_model in model_upgrade:
+                adapted["base_model"] = model_upgrade[current_model]
+                logger.info("[det-refine] Model upgrade: %s → %s",
+                            current_model, adapted["base_model"])
+
+        # Large gap between mAP50 and mAP50-95 → poor bbox precision
+        if map50 > 0 and map50_95 > 0 and (map50 - map50_95) > 20:
+            logger.info("[det-refine] Large mAP50-mAP95 gap (%.1f) → improve bbox precision",
+                        map50 - map50_95)
+            adapted["extra"] = adapted.get("extra", {})
+            adapted["extra"]["dfl"] = 2.5  # increase DFL loss
+            adapted["extra"]["box"] = 10.0  # increase box loss
+
+        # Good performance → try refinement techniques
+        if map50_95 > 45:
+            logger.info("[det-refine] Good mAP (%.1f%%) → try fine-tuning techniques", map50_95)
+            adapted["extra"] = adapted.get("extra", {})
+            adapted["extra"]["copy_paste"] = 0.1
+            adapted["epochs"] = max(adapted.get("epochs", 50), 100)
+            adapted["extra"]["patience"] = 20
+
+        # Start from best config
+        if best.get("map50_95", 0) > map50_95:
+            best_config = best.get("config", {})
+            adapted["lr"] = best_config.get("lr", adapted.get("lr", 0.01))
+            adapted["batch_size"] = best_config.get("batch_size", adapted.get("batch_size", 16))
+            logger.info("[det-refine] Using best trial's base config (mAP=%.1f%%)",
+                        best.get("map50_95", 0))
+
         return adapted
 
     def run_trials(
