@@ -197,6 +197,247 @@ def get_technique_catalog(task_type: str = "classification") -> dict[str, dict]:
     return VISION_TECHNIQUE_CATALOG
 
 
+# ---------------------------------------------------------------------------
+# Self-Evolution Engine — Research Agent learns from its own experiments
+# ---------------------------------------------------------------------------
+
+class SelfEvolutionEngine:
+    """Tracks technique effectiveness and evolves search strategy over trials.
+
+    Core capabilities:
+    1. Effectiveness Tracking: records score delta for each technique applied
+    2. Priority Reranking: reorders technique priority based on observed impact
+    3. Config Mutation: generates new configs by mutating successful ones
+    4. Pattern Discovery: learns technique combinations that work well together
+    5. Persistent Memory: saves evolution state to disk across sessions
+    """
+
+    def __init__(self, store_path: str | Path | None = None):
+        self.store_path = Path(store_path) if store_path else Path.home() / ".cache" / "alchemist" / "evolution.json"
+        self.store_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # technique_name → {total_delta, count, avg_delta, best_score}
+        self.technique_scores: dict[str, dict] = {}
+        # Successful config combinations
+        self.winning_configs: list[dict] = []
+        # Technique co-occurrence patterns: (tech_a, tech_b) → avg_delta
+        self.combo_scores: dict[str, float] = {}
+        # Generation counter
+        self.generation: int = 0
+
+        self._load()
+
+    def _load(self):
+        """Load evolution state from disk."""
+        if self.store_path.exists():
+            try:
+                with open(self.store_path) as f:
+                    data = json.load(f)
+                self.technique_scores = data.get("technique_scores", {})
+                self.winning_configs = data.get("winning_configs", [])
+                self.combo_scores = data.get("combo_scores", {})
+                self.generation = data.get("generation", 0)
+                logger.info("[evolution] Loaded: gen=%d, %d techniques tracked, %d winners",
+                            self.generation, len(self.technique_scores), len(self.winning_configs))
+            except Exception as e:
+                logger.warning("[evolution] Load failed: %s", e)
+
+    def save(self):
+        """Persist evolution state to disk."""
+        try:
+            with open(self.store_path, "w") as f:
+                json.dump({
+                    "technique_scores": self.technique_scores,
+                    "winning_configs": self.winning_configs[-20:],  # keep last 20
+                    "combo_scores": self.combo_scores,
+                    "generation": self.generation,
+                }, f, indent=2)
+            logger.info("[evolution] Saved: gen=%d", self.generation)
+        except Exception as e:
+            logger.warning("[evolution] Save failed: %s", e)
+
+    def record_trial(self, config: dict, score: float, baseline: float,
+                     techniques_applied: list[str] | None = None):
+        """Record a trial result and update technique effectiveness scores."""
+        delta = score - baseline
+        if techniques_applied is None:
+            techniques_applied = self._extract_techniques(config)
+
+        for tech in techniques_applied:
+            if tech not in self.technique_scores:
+                self.technique_scores[tech] = {
+                    "total_delta": 0.0, "count": 0,
+                    "avg_delta": 0.0, "best_score": 0.0,
+                }
+            ts = self.technique_scores[tech]
+            ts["total_delta"] += delta
+            ts["count"] += 1
+            ts["avg_delta"] = ts["total_delta"] / ts["count"]
+            ts["best_score"] = max(ts["best_score"], score)
+
+        # Record winning config if above baseline
+        if delta > 0:
+            self.winning_configs.append({
+                "config": config, "score": score, "delta": delta,
+                "techniques": techniques_applied, "generation": self.generation,
+            })
+
+        # Record technique combinations
+        if len(techniques_applied) >= 2 and delta > 0:
+            for i, t1 in enumerate(techniques_applied):
+                for t2 in techniques_applied[i+1:]:
+                    key = "|".join(sorted([t1, t2]))
+                    prev = self.combo_scores.get(key, 0.0)
+                    self.combo_scores[key] = (prev + delta) / 2  # running avg
+
+    def get_priority_ranking(self) -> list[tuple[str, float]]:
+        """Return techniques ranked by observed effectiveness (descending)."""
+        ranked = sorted(
+            self.technique_scores.items(),
+            key=lambda x: x[1]["avg_delta"],
+            reverse=True,
+        )
+        return [(name, stats["avg_delta"]) for name, stats in ranked]
+
+    def get_best_combos(self, top_k: int = 5) -> list[tuple[str, float]]:
+        """Return best-performing technique combinations."""
+        ranked = sorted(self.combo_scores.items(), key=lambda x: -x[1])
+        return [(combo, delta) for combo, delta in ranked[:top_k]]
+
+    def mutate_config(self, config: dict, mutation_rate: float = 0.3) -> dict:
+        """Generate a new config by mutating a successful config.
+
+        Applies random perturbations to numerical values and swaps techniques.
+        """
+        mutated = dict(config)
+        import random
+
+        # Mutate numerical values
+        for key in ["lr", "batch_size", "epochs", "img_size", "weight_decay"]:
+            if key in mutated and random.random() < mutation_rate:
+                val = mutated[key]
+                if isinstance(val, float):
+                    factor = random.choice([0.5, 0.7, 1.0, 1.5, 2.0])
+                    mutated[key] = val * factor
+                elif isinstance(val, int):
+                    factor = random.choice([0.5, 0.75, 1.0, 1.5, 2.0])
+                    mutated[key] = max(1, int(val * factor))
+
+        # Swap model variant with small probability
+        if "base_model" in mutated and random.random() < mutation_rate * 0.5:
+            model_families = {
+                "yolov8": ["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x"],
+                "yolo11": ["yolo11n", "yolo11s", "yolo11m", "yolo11l", "yolo11x"],
+                "rtdetr": ["rtdetr-l", "rtdetr-x"],
+            }
+            current = mutated["base_model"]
+            for family, variants in model_families.items():
+                if current in variants:
+                    mutated["base_model"] = random.choice(variants)
+                    break
+
+        self.generation += 1
+        return mutated
+
+    def evolve_next_configs(self, catalog: dict, n_configs: int = 4) -> list[dict]:
+        """Generate evolved configs based on accumulated experience.
+
+        Strategy:
+        1. Top-ranked techniques from effectiveness tracking
+        2. Best config mutations from winning configs
+        3. Promising untried combinations
+        """
+        configs = []
+
+        # Strategy 1: Apply top-ranked techniques to best base config
+        ranking = self.get_priority_ranking()
+        if self.winning_configs:
+            best_winner = max(self.winning_configs, key=lambda w: w["score"])
+            base = dict(best_winner["config"])
+
+            for tech_name, avg_delta in ranking[:3]:
+                if avg_delta > 0 and len(configs) < n_configs:
+                    cfg = dict(base)
+                    if tech_name in catalog:
+                        overrides = catalog[tech_name]
+                        for k, v in overrides.items():
+                            if k == "extra":
+                                cfg.setdefault("extra", {}).update(v)
+                            else:
+                                cfg[k] = v
+                    configs.append(cfg)
+                    logger.info("[evolution] Config from top tech '%s' (avg_delta=+%.2f)",
+                                tech_name, avg_delta)
+
+        # Strategy 2: Mutate best winning configs
+        for winner in sorted(self.winning_configs, key=lambda w: -w["score"])[:2]:
+            if len(configs) < n_configs:
+                mutated = self.mutate_config(winner["config"])
+                configs.append(mutated)
+                logger.info("[evolution] Mutated config from winner (score=%.2f)",
+                            winner["score"])
+
+        # Strategy 3: Try best untried combos
+        best_combos = self.get_best_combos(3)
+        for combo_key, delta in best_combos:
+            if len(configs) < n_configs:
+                techs = combo_key.split("|")
+                cfg = {}
+                for tech in techs:
+                    if tech in catalog:
+                        for k, v in catalog[tech].items():
+                            if k == "extra":
+                                cfg.setdefault("extra", {}).update(v)
+                            else:
+                                cfg[k] = v
+                configs.append(cfg)
+                logger.info("[evolution] Config from combo '%s' (avg_delta=+%.2f)",
+                            combo_key, delta)
+
+        return configs[:n_configs]
+
+    def summarize(self) -> str:
+        """Human-readable evolution summary."""
+        lines = [f"=== Evolution Engine (Gen {self.generation}) ==="]
+        lines.append(f"Techniques tracked: {len(self.technique_scores)}")
+        lines.append(f"Winning configs: {len(self.winning_configs)}")
+
+        ranking = self.get_priority_ranking()
+        if ranking:
+            lines.append("\nTop techniques by effectiveness:")
+            for name, delta in ranking[:10]:
+                count = self.technique_scores[name]["count"]
+                lines.append(f"  {name:30s}: avg_delta={delta:+.2f}  (n={count})")
+
+        combos = self.get_best_combos(5)
+        if combos:
+            lines.append("\nBest combinations:")
+            for combo, delta in combos:
+                lines.append(f"  {combo:40s}: avg_delta={delta:+.2f}")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _extract_techniques(config: dict) -> list[str]:
+        """Infer technique names from a config dict."""
+        techs = []
+        if config.get("base_model"):
+            techs.append(config["base_model"])
+        if config.get("extra", {}).get("mosaic", 0) > 0:
+            techs.append("mosaic_on")
+        if config.get("extra", {}).get("mixup", 0) > 0:
+            techs.append("mixup_det")
+        if config.get("extra", {}).get("copy_paste", 0) > 0:
+            techs.append("copy_paste")
+        if config.get("extra", {}).get("cos_lr"):
+            techs.append("cosine_lr")
+        if config.get("img_size", 640) > 640:
+            techs.append(f"resolution_{config['img_size']}")
+        if config.get("epochs", 50) > 50:
+            techs.append("long_training")
+        return techs if techs else ["baseline"]
+
+
 class ResearchLog:
     """Research Agent의 전체 연구 과정을 기록하는 로그.
 
