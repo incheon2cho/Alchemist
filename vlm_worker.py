@@ -677,6 +677,20 @@ def run_vlm_training(
                     llm.save_pretrained(str(mid_ckpt / "lora_adapter"))
                     logger.info("  [checkpoint] Saved at step %d → %s", global_step, mid_ckpt)
 
+                    # S3 backup
+                    s3_bucket = config.get("s3_backup_bucket", "alchemist-checkpoints")
+                    if s3_bucket:
+                        s3_prefix = f"vlm_trial{trial_id}_step{global_step}"
+                        try:
+                            import subprocess
+                            subprocess.run(
+                                ["aws", "s3", "sync", str(mid_ckpt), f"s3://{s3_bucket}/{s3_prefix}/"],
+                                timeout=120, capture_output=True,
+                            )
+                            logger.info("  [s3-backup] Uploaded to s3://%s/%s/", s3_bucket, s3_prefix)
+                        except Exception as e:
+                            logger.warning("  [s3-backup] Failed: %s", e)
+
                 # Early stop at max_steps if set
                 max_steps = config.get("max_steps", 0)
                 if max_steps > 0 and global_step >= max_steps:
@@ -726,6 +740,20 @@ def run_vlm_training(
     # Save LoRA adapter
     llm.save_pretrained(str(ckpt_path / "lora_adapter"))
     logger.info("  Checkpoint saved: %s", ckpt_path)
+
+    # S3 backup (final checkpoint)
+    s3_bucket = config.get("s3_backup_bucket", "alchemist-checkpoints")
+    if s3_bucket:
+        try:
+            import subprocess
+            s3_prefix = f"vlm_trial{trial_id}_final"
+            subprocess.run(
+                ["aws", "s3", "sync", str(ckpt_path), f"s3://{s3_bucket}/{s3_prefix}/"],
+                timeout=120, capture_output=True,
+            )
+            logger.info("  [s3-backup] Final checkpoint → s3://%s/%s/", s3_bucket, s3_prefix)
+        except Exception as e:
+            logger.warning("  [s3-backup] Failed: %s", e)
 
     # 9. Evaluate on Video-MME if available
     eval_score = 0.0
@@ -875,19 +903,17 @@ def run_vlm_eval(
             if is_correct:
                 duration_stats[duration]["correct"] += 1
 
-            # Track by question type
-            q_lower = question.lower()
-            if any(k in q_lower for k in ["when", "before", "after", "first", "last", "order"]):
-                qtype = "temporal"
-            elif any(k in q_lower for k in ["how many", "count", "number"]):
-                qtype = "counting"
-            elif any(k in q_lower for k in ["why", "reason", "cause"]):
-                qtype = "causal"
-            else:
-                qtype = "descriptive"
+            # Track by official Video-MME task_type (12 types)
+            qtype = sample.get("task_type", "") or "unknown"
             qtype_stats[qtype]["total"] += 1
             if is_correct:
                 qtype_stats[qtype]["correct"] += 1
+
+            # Track by domain
+            domain = sample.get("domain", "") or "unknown"
+            duration_stats[f"domain:{domain}"]["total"] += 1
+            if is_correct:
+                duration_stats[f"domain:{domain}"]["correct"] += 1
 
         except Exception:
             continue
@@ -907,11 +933,19 @@ def run_vlm_eval(
         acc = 100.0 * s["correct"] / max(s["total"], 1)
         logger.info("    %s: %d/%d = %.1f%%", dur, s["correct"], s["total"], acc)
 
-    logger.info("  === Question Type Breakdown ===")
-    for qt in ["descriptive", "temporal", "counting", "causal"]:
-        s = qtype_stats.get(qt, {"correct": 0, "total": 0})
+    logger.info("  === Task Type Breakdown (12 types) ===")
+    sorted_types = sorted(qtype_stats.items(), key=lambda x: -x[1]["total"])
+    for qt, s in sorted_types:
         acc = 100.0 * s["correct"] / max(s["total"], 1)
-        logger.info("    %s: %d/%d = %.1f%%", qt, s["correct"], s["total"], acc)
+        logger.info("    %-25s: %d/%d = %.1f%%", qt, s["correct"], s["total"], acc)
+
+    logger.info("  === Domain Breakdown ===")
+    for key in sorted(duration_stats.keys()):
+        if key.startswith("domain:"):
+            domain = key.replace("domain:", "")
+            s = duration_stats[key]
+            acc = 100.0 * s["correct"] / max(s["total"], 1)
+            logger.info("    %-25s: %d/%d = %.1f%%", domain, s["correct"], s["total"], acc)
 
     return accuracy
 
