@@ -285,8 +285,14 @@ class BenchmarkAgent:
                 )
 
         logger.info(
-            "SoTA standing for %s: top=%.2f%% (%s)",
+            "[REASONING] SoTA standing for %s:\n"
+            "  Current SoTA: %.2f%% by %s\n"
+            "  Source: %s\n"
+            "  Implication: our model ceiling is ~%.1f%% (gap: ~%.1f%%p from SoTA)",
             task.name, result["top_score_pct"] or 0.0, result["top_model"],
+            "PwC archive" if result.get("entries") else "LLM estimation",
+            task_meta.model_ceilings.get(task_meta.known_models[0]["name"], 55) if task_meta and task_meta.known_models else 55,
+            (result["top_score_pct"] or 0) - (task_meta.model_ceilings.get(task_meta.known_models[0]["name"], 55) if task_meta and task_meta.known_models else 55),
         )
         return result
 
@@ -721,6 +727,18 @@ class BenchmarkAgent:
         # Limited to the top-3 by overall_rank to keep the baseline pass fast.
         leaderboard.candidates = [e.model_name for e in candidates[:3]]
 
+        logger.info(
+            "[REASONING] Benchmark Agent model selection:\n"
+            "  Task: %s (%s)\n"
+            "  Candidates evaluated: %d models\n"
+            "  Selected: %s (rank=%d, params=%.0fM)\n"
+            "  Why: %s\n"
+            "  Alternatives: %s",
+            task.name, task.eval_metric,
+            len(candidates), best.model_name, best.overall_rank, best.params_m,
+            llm_reason[:300] if llm_reason else "highest ranked",
+            ", ".join(e.model_name for e in candidates[1:4]),
+        )
         logger.info(
             "Recommendation: %s (rank=%d, params=%.0fM); top-K candidates=%s",
             best.model_name, best.overall_rank, best.params_m,

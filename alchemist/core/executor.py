@@ -229,8 +229,20 @@ class AWSExecutor(TrainingExecutor):
         else:
             baseline_epochs = 3  # Small/medium models: quick
         baseline_config["epochs"] = baseline_epochs
-        logger.info("Baseline: %s → %d epochs (auto-determined by model size)",
-                     base_model, baseline_epochs)
+        logger.info(
+            "[REASONING] Baseline evaluation config:\n"
+            "  Model: %s\n"
+            "  Epochs: %d (auto-determined: %s)\n"
+            "  Config: batch=%s, lr=%s, img_size=%s\n"
+            "  Rationale: %s",
+            base_model, baseline_epochs,
+            "rtdetr ~2h/ep → 1ep" if "rtdetr" in model_lower
+            else "large YOLO ~25min/ep → 2ep" if any(s in model_lower for s in ("11x", "8x"))
+            else "medium model → 3ep",
+            baseline_config.get("batch_size"), baseline_config.get("lr"),
+            baseline_config.get("img_size"),
+            "Quick evaluation to establish baseline performance before multi-trial optimization",
+        )
 
         job = {
             "command": "baseline",

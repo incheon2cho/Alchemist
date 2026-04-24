@@ -817,7 +817,16 @@ class ResearchAgent:
                     adapted_cfg = TrialConfig(**{k: v for k, v in adapted.items() if k in tc_fields})
                     adapted_configs.append(adapted_cfg)
                 configs = adapted_configs
-                logger.info("[adapt] Applied _adapt_detection_from_results to %d configs", len(configs))
+                # Log adaptation reasoning
+                last_trial = all_trials[-1] if all_trials else None
+                if last_trial:
+                    logger.info(
+                        "[REASONING] Adaptation based on previous results:\n"
+                        "  Last trial: model=%s, score=%.1f%%\n"
+                        "  Adapted %d configs based on metric patterns\n"
+                        "  Adaptations applied by _adapt_detection_from_results",
+                        last_trial.config.base_model, last_trial.score, len(configs),
+                    )
 
             # 2b. Run trials
             trials = self.run_trials(
@@ -1129,6 +1138,26 @@ class ResearchAgent:
                     cfg_dict = {k: v for k, v in t.items() if k in tc_fields}
                     configs.append(TrialConfig(**cfg_dict))
 
+                # Log reasoning for each trial config
+                for i, cfg in enumerate(configs):
+                    model_name = cfg.base_model or gpu_model
+                    ceiling = task_meta.model_ceilings.get(model_name, 0)
+                    logger.info(
+                        "[REASONING] R1 Trial %d config:\n"
+                        "  Model: %s (ceiling: %.1f%%, params: %sM)\n"
+                        "  Epochs: %d (auto: %dmin/ep × %d ep = %dmin)\n"
+                        "  Resolution: %dpx, Batch: %d, LR: %s\n"
+                        "  Augmentation: %s\n"
+                        "  Why: %s",
+                        i + 1, model_name, ceiling,
+                        next((m["params_m"] for m in task_meta.known_models if m["name"] == model_name), "?"),
+                        cfg.epochs, _epoch_minutes.get(model_name, 20), cfg.epochs,
+                        _epoch_minutes.get(model_name, 20) * cfg.epochs,
+                        cfg.img_size, cfg.batch_size, cfg.lr,
+                        cfg.extra if cfg.extra else "default",
+                        ["GPU-optimal baseline", "Higher resolution (small object focus)",
+                         "Lower LR + longer training (convergence)", "Larger model (higher ceiling)"][min(i, 3)],
+                    )
                 logger.info("R1 non-classification: %d configs for %s (gpu_model=%s)",
                             len(configs), task_meta.task_type, gpu_model)
 

@@ -231,6 +231,13 @@ class ControllerAgent:
                 f"> 3.0 — optimizer divergence"
             )
 
+        logger.info(
+            "[REASONING] Trial progress evaluation:\n"
+            "  Epoch %d/%d, metric=%.1f%%, train_loss=%.2f\n"
+            "  Baseline: %.1f%%, Best so far: %.1f%%\n"
+            "  Decision: CONTINUE (no early-stop triggers met)",
+            epoch, total, val, train_loss, baseline_score, best_so_far,
+        )
         return True, f"continue (epoch {epoch}/{total}, metric={val:.1f}%)"
 
     # ------------------------------------------------------------------
