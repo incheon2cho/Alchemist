@@ -1694,6 +1694,10 @@ class ResearchAgent:
                 "yolov8m": "yolov8l", "yolov8l": "yolov8x",
                 "yolo11n": "yolo11s", "yolo11s": "yolo11m",
                 "yolo11m": "yolo11l", "yolo11l": "yolo11x",
+                # Cross-architecture: YOLO top → RT-DETR (higher mAP ceiling)
+                "yolov8x": "rtdetr-l", "yolo11x": "rtdetr-l",
+                # RT-DETR internal upgrades
+                "rtdetr-l": "rtdetr-x",
             }
             current_model = adapted.get("base_model", "yolov8m")
             if current_model in model_upgrade:
