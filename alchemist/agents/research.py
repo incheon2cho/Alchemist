@@ -1139,26 +1139,47 @@ class ResearchAgent:
 
                 prompt = (
                     f"You are a Research Agent designing the next training trial to MAXIMIZE {task.eval_metric}.\n\n"
-                    f"Task: {task.description}\n"
-                    f"GPU: {remote_gpu_gb or 46}GB, Time remaining: ~{8 - (round_num * 2)}h\n"
+                    f"## Task\n{task.description}\n"
+                    f"GPU: {remote_gpu_gb or 46}GB | Time remaining: ~{8 - (round_num * 2)}h\n"
                     f"GPU-optimal model: {gpu_model}\n\n"
-                    f"Available models & ceilings:\n{models_info}\n\n"
-                    f"Available techniques: {list(task_meta.technique_catalog.keys())[:20]}\n\n"
+                    f"## Available models & published ceilings (pretrained COCO val)\n{models_info}\n\n"
+                    f"## Available training techniques\n{list(task_meta.technique_catalog.keys())[:20]}\n\n"
                     f"{upstream_context}\n"
                     f"{cross_task_exp}\n"
-                    f"Previous results:\n{prior_results or 'No previous trials (this is the first trial)'}\n\n"
-                    f"Design ONE training config that maximizes {task.eval_metric}.\n"
-                    f"Return ONLY JSON: {{\"base_model\": \"...\", \"epochs\": N, \"batch_size\": N, "
+                    f"## Previous trial results\n{prior_results or '(First trial — no previous results)'}\n\n"
+                    f"## Instructions\n"
+                    f"Respond with a structured JSON containing these fields:\n"
+                    f"1. **analysis**: What patterns/issues do you observe from previous results? "
+                    f"(e.g., 'mAP plateaued at 48% with yolov8m, near its 50.2% ceiling')\n"
+                    f"2. **diagnosis**: What is the main bottleneck limiting performance? "
+                    f"(e.g., 'model capacity ceiling', 'insufficient training', 'low recall on small objects')\n"
+                    f"3. **prescription**: What specific change will address this bottleneck? "
+                    f"(e.g., 'upgrade to yolov8x (ceiling 53.9%) to raise capacity ceiling')\n"
+                    f"4. **expected_improvement**: What {task.eval_metric} improvement do you expect and why?\n"
+                    f"5. **config**: The training config dict with: base_model, epochs, batch_size, "
+                    f"img_size, lr, optimizer, patience, extra (dict of augmentation/training params)\n\n"
+                    f"Return ONLY JSON:\n"
+                    f"{{\n"
+                    f"  \"analysis\": \"...\",\n"
+                    f"  \"diagnosis\": \"...\",\n"
+                    f"  \"prescription\": \"...\",\n"
+                    f"  \"expected_improvement\": \"...\",\n"
+                    f"  \"config\": {{\"base_model\": \"...\", \"epochs\": N, \"batch_size\": N, "
                     f"\"img_size\": N, \"lr\": N, \"optimizer\": \"...\", \"patience\": N, "
-                    f"\"extra\": {{\"cos_lr\": true, \"mosaic\": 1.0, ...}}, "
-                    f"\"reasoning\": \"why this config\"}}"
+                    f"\"extra\": {{\"cos_lr\": true, \"mosaic\": 1.0, ...}}}}\n"
+                    f"}}"
                 )
 
-                llm_config = safe_llm_call(self.llm, prompt, fallback={})
+                llm_response = safe_llm_call(self.llm, prompt, fallback={})
 
-                if isinstance(llm_config, dict) and llm_config.get("base_model"):
-                    # LLM successfully designed a config
-                    reasoning = llm_config.pop("reasoning", "LLM-designed")
+                # Parse structured response
+                if isinstance(llm_response, dict) and llm_response.get("config"):
+                    analysis = llm_response.get("analysis", "")
+                    diagnosis = llm_response.get("diagnosis", "")
+                    prescription = llm_response.get("prescription", "")
+                    expected = llm_response.get("expected_improvement", "")
+                    llm_config = llm_response["config"]
+
                     # Auto-determine epochs if LLM didn't account for speed
                     model_name = llm_config.get("base_model", gpu_model)
                     speed = _epoch_minutes.get(model_name, 20)
@@ -1171,13 +1192,42 @@ class ResearchAgent:
                     configs.append(TrialConfig(**cfg_dict))
 
                     logger.info(
-                        "[REASONING] Trial %d config (LLM-designed):\n"
-                        "  Model: %s, Epochs: %d, ImgSize: %d, LR: %s, Batch: %d\n"
-                        "  Why: %s",
-                        round_num, model_name, llm_config.get("epochs", 0),
+                        "[REASONING] Trial %d — Claude decision:\n"
+                        "  Analysis: %s\n"
+                        "  Diagnosis: %s\n"
+                        "  Prescription: %s\n"
+                        "  Expected: %s\n"
+                        "  Config: model=%s, epochs=%d, img=%d, lr=%s, batch=%d",
+                        round_num,
+                        analysis[:200], diagnosis[:200], prescription[:200], expected[:200],
+                        model_name, llm_config.get("epochs", 0),
                         llm_config.get("img_size", 640), llm_config.get("lr", 0.01),
-                        llm_config.get("batch_size", 16), reasoning,
+                        llm_config.get("batch_size", 16),
                     )
+
+                    # Save structured reasoning to research log
+                    self.research_log.record("reasoning", "trial_decision", {
+                        "trial_num": round_num,
+                        "analysis": analysis,
+                        "diagnosis": diagnosis,
+                        "prescription": prescription,
+                        "expected_improvement": expected,
+                        "config": llm_config,
+                    }, round_num)
+
+                elif isinstance(llm_response, dict) and llm_response.get("base_model"):
+                    # Flat config without structured reasoning (backward compat)
+                    llm_config = llm_response
+                    model_name = llm_config.get("base_model", gpu_model)
+                    speed = _epoch_minutes.get(model_name, 20)
+                    max_epochs = max(3, int(120 / speed))
+                    if llm_config.get("epochs", 50) > max_epochs:
+                        llm_config["epochs"] = max_epochs
+                    tc_fields = {f.name for f in TrialConfig.__dataclass_fields__.values()}
+                    cfg_dict = {k: v for k, v in llm_config.items() if k in tc_fields}
+                    configs.append(TrialConfig(**cfg_dict))
+                    logger.info("[REASONING] Trial %d (flat config): model=%s, epochs=%d",
+                                round_num, model_name, llm_config.get("epochs", 0))
                 else:
                     # LLM fallback: use GPU-optimal model with good defaults
                     base_cfg = dict(task_meta.default_config)
