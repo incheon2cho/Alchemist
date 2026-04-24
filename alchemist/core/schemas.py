@@ -69,7 +69,7 @@ class TrialConfig:
     weight_decay: float = 0.01
     scheduler: str = "cosine"
     augmentation: str = "basic"
-    freeze_backbone: bool = True
+    freeze_backbone: bool = False
     adapter: str = "none"                 # "none" | "lora" | "linear_head"
     # Advanced techniques — propagated to train_worker.py
     optimizer: str = "adamw"              # "adamw" | "sgd" | "sam"
@@ -85,10 +85,23 @@ class TrialConfig:
     backbone_lr_scale: float = 1.0        # LLRD (layer-wise LR decay)
     sam_rho: float = 0.05
     # Universal fields (used by detection/segmentation/pose workers)
-    img_size: int = 224
+    img_size: int = 640
     patience: int = 10
     base_model: str = ""                  # model name for detection/seg/pose
     extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def for_task(cls, task_name: str) -> "TrialConfig":
+        """Create a TrialConfig populated from TaskRegistry defaults.
+
+        No hardcoded overrides — all values come from the registry's
+        default_config for the detected task type.
+        """
+        from alchemist.core.task_registry import get_task_meta_for_name
+        meta = get_task_meta_for_name(task_name)
+        tc_fields = {f.name for f in cls.__dataclass_fields__.values()}
+        kwargs = {k: v for k, v in meta.default_config.items() if k in tc_fields}
+        return cls(**kwargs)
 
 
 @dataclass

@@ -1224,15 +1224,14 @@ class ResearchAgent:
                     logger.info("[REASONING] Trial %d (flat config): model=%s, epochs=%d",
                                 round_num, model_name, llm_config.get("epochs", 0))
                 else:
-                    # LLM fallback: use GPU-optimal model with good defaults
-                    base_cfg = dict(task_meta.default_config)
-                    base_cfg["base_model"] = gpu_model
+                    # LLM fallback: use task-aware defaults + GPU-optimal model
+                    fallback_cfg = TrialConfig.for_task(task.name)
+                    fallback_cfg.base_model = gpu_model
                     speed = _epoch_minutes.get(gpu_model, 20)
-                    base_cfg["epochs"] = max(3, int(120 / speed))
-                    base_cfg["extra"] = {"cos_lr": True, "close_mosaic": 10,
+                    fallback_cfg.epochs = max(3, int(120 / speed))
+                    fallback_cfg.extra = {"cos_lr": True, "close_mosaic": 10,
                         "mosaic": 1.0, "mixup": 0.15, "copy_paste": 0.1, "erasing": 0.4}
-                    tc_fields = {f.name for f in TrialConfig.__dataclass_fields__.values()}
-                    configs.append(TrialConfig(**{k: v for k, v in base_cfg.items() if k in tc_fields}))
+                    configs.append(fallback_cfg)
                     logger.info("[REASONING] Trial %d config (fallback): %s %d epochs",
                                 round_num, gpu_model, base_cfg["epochs"])
 
