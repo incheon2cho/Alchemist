@@ -737,68 +737,75 @@ class ResearchAgent:
         task_type = task.name.lower()
         catalog = get_technique_catalog(task_type)
 
-        for round_num in range(1, self.max_rounds + 1):
-            remaining_budget = budget - total_budget_used
+        # 3. Trial-by-trial adaptive loop
+        #    No round boundaries — each trial is designed based on ALL previous results.
+        #    Loop continues until budget is exhausted.
+        from alchemist.core.task_registry import get_task_meta_for_name as _get_meta
+        _task_meta = _get_meta(task.name)
+        max_total_trials = self.max_trials * self.max_rounds  # total budget
 
-            if remaining_budget <= 0:
-                self.research_log.record(
-                    "loop", "budget_exhausted", {
-                        "remaining_budget": round(remaining_budget, 2),
-                    }, round_num,
-                )
+        trial_num = 0
+        while trial_num < max_total_trials:
+            remaining_budget = budget - total_budget_used
+            if remaining_budget <= 0.5:  # 30min minimum
+                self.research_log.record("loop", "budget_exhausted", {
+                    "remaining_budget": round(remaining_budget, 2),
+                }, trial_num)
                 break
 
-            # 2a. Design experiments (informed by prior analysis + evolution)
-            # Round 2+: inject evolved configs from SelfEvolutionEngine
+            trial_num += 1
+
+            # ── Design next trial config (Claude-driven) ──
             evolved_context = ""
-            if round_num > 1 and all_trials:
-                # Internal evolution: generate configs from experience
-                evolved_configs = evolution.evolve_next_configs(catalog, n_configs=2)
-                # External SoTA: LLM-driven technique discovery
+            if all_trials:
+                # Evolution: learn from all previous trials
+                evolved_configs = evolution.evolve_next_configs(catalog, n_configs=1)
                 trial_history = [
                     {"config": safe_asdict(t.config) if hasattr(t.config, '__dataclass_fields__') else {},
                      "score": t.score, "map50_95": t.score,
                      "applied_techniques": getattr(t, "applied_techniques", {})}
                     for t in all_trials
                 ]
-                external_configs = evolution.evolve_with_external_knowledge(
-                    self.llm, task, best_score, catalog, trial_history,
-                )
+                # LLM-driven external knowledge (every 3rd trial to save LLM calls)
+                external_configs = []
+                if trial_num % 3 == 0:
+                    external_configs = evolution.evolve_with_external_knowledge(
+                        self.llm, task, best_score, catalog, trial_history,
+                    )
                 evolved_context = (
-                    f"\n## Evolution Engine Suggestions (Gen {evolution.generation}):\n"
-                    f"{evolution.summarize()}\n"
-                    f"Evolved configs: {len(evolved_configs)}, External configs: {len(external_configs)}\n"
+                    f"\n## Previous trials ({len(all_trials)} total, best={best_score:.1f}%):\n"
+                    + "\n".join(
+                        f"  Trial {t.trial_id}: model={t.config.base_model}, "
+                        f"img={t.config.img_size}, lr={t.config.lr}, "
+                        f"ep={t.config.epochs} → {t.score:.1f}%"
+                        for t in all_trials[-5:]
+                    )
+                    + f"\n\nEvolution gen {evolution.generation}: "
+                    + f"top techs={evolution.get_priority_ranking()[:3]}\n"
                 )
-                self.research_log.record("evolution", "round_evolution", {
+                self.research_log.record("evolution", "trial_evolution", {
+                    "trial_num": trial_num,
                     "evolved_configs": len(evolved_configs),
                     "external_configs": len(external_configs),
+                    "best_so_far": best_score,
                     "top_techniques": evolution.get_priority_ranking()[:5],
-                    "best_combos": evolution.get_best_combos(3),
-                }, round_num)
+                }, trial_num)
 
+            # Design 1 config for this trial
             configs = self.design_experiment(
                 base_model, task, upstream_context + evolved_context,
                 prior_analysis=analysis_history,
-                remaining_trials=self.max_trials,
+                remaining_trials=1,  # one trial at a time
                 sota_knowledge=sota_knowledge,
-                round_num=round_num,
+                round_num=trial_num,
             )
-            self.research_log.record("design", "experiment_designed", {
-                "num_configs": len(configs),
-                "configs": [
-                    {"lr": c.lr, "freeze": c.freeze_backbone, "adapter": c.adapter}
-                    for c in configs
-                ],
-            }, round_num)
 
             if not configs:
-                self.research_log.record("design", "no_configs_generated", {}, round_num)
+                self.research_log.record("design", "no_config", {}, trial_num)
                 break
 
-            # 2a-2. Adapt configs based on previous results (non-classification)
-            from alchemist.core.task_registry import get_task_meta_for_name as _get_meta
-            _task_meta = _get_meta(task.name)
-            if _task_meta.task_type != "classification" and round_num > 1 and all_trials:
+            # Adapt config based on previous results (non-classification)
+            if _task_meta.task_type != "classification" and all_trials:
                 trial_dicts = []
                 for t in all_trials:
                     td = safe_asdict(t.config) if hasattr(t.config, '__dataclass_fields__') else {}
@@ -812,50 +819,60 @@ class ResearchAgent:
                 for cfg in configs:
                     cfg_dict = safe_asdict(cfg)
                     adapted = self._adapt_detection_from_results(cfg_dict, trial_dicts)
-                    # Rebuild TrialConfig from adapted dict
                     tc_fields = {f.name for f in TrialConfig.__dataclass_fields__.values()}
                     adapted_cfg = TrialConfig(**{k: v for k, v in adapted.items() if k in tc_fields})
                     adapted_configs.append(adapted_cfg)
                 configs = adapted_configs
-                # Log adaptation reasoning
-                last_trial = all_trials[-1] if all_trials else None
-                if last_trial:
-                    logger.info(
-                        "[REASONING] Adaptation based on previous results:\n"
-                        "  Last trial: model=%s, score=%.1f%%\n"
-                        "  Adapted %d configs based on metric patterns\n"
-                        "  Adaptations applied by _adapt_detection_from_results",
-                        last_trial.config.base_model, last_trial.score, len(configs),
-                    )
 
-            # 2b. Run trials
+                logger.info(
+                    "[REASONING] Trial %d adapted from %d previous results:\n"
+                    "  Best so far: %.1f%% | Last: %.1f%%\n"
+                    "  Config: model=%s, img=%d, lr=%s, ep=%d",
+                    trial_num, len(all_trials), best_score,
+                    all_trials[-1].score,
+                    configs[0].base_model, configs[0].img_size,
+                    configs[0].lr, configs[0].epochs,
+                )
+
+            self.research_log.record("design", "trial_designed", {
+                "trial_num": trial_num,
+                "config": {"model": configs[0].base_model, "lr": configs[0].lr,
+                           "epochs": configs[0].epochs, "img_size": configs[0].img_size},
+            }, trial_num)
+
+            # ── Run single trial ──
             trials = self.run_trials(
                 base_model, task, configs, remaining_budget,
                 baseline_score=baseline,
             )
             all_trials.extend(trials)
-            round_time = sum(t.elapsed_s for t in trials)
-            total_budget_used += round_time / 3600
+            trial_time = sum(t.elapsed_s for t in trials)
+            total_budget_used += trial_time / 3600
 
-            self.research_log.record("execution", "trials_completed", {
-                "num_trials": len(trials),
-                "scores": [round(t.score, 2) for t in trials],
-                "best_this_round": round(max(t.score for t in trials), 2) if trials else 0,
-                "elapsed_s": round(round_time, 1),
+            self.research_log.record("execution", "trial_completed", {
+                "trial_num": trial_num,
+                "score": round(trials[0].score, 2) if trials else 0,
+                "elapsed_s": round(trial_time, 1),
                 "budget_used_hours": round(total_budget_used, 2),
-            }, round_num)
+                "budget_remaining_hours": round(remaining_budget - trial_time / 3600, 2),
+            }, trial_num)
 
             if not trials:
-                self.research_log.record("execution", "all_trials_failed", {}, round_num)
-                break
+                self.research_log.record("execution", "trial_failed", {}, trial_num)
+                continue  # try next trial instead of breaking
 
-            # Update best
-            round_best = max(trials, key=lambda t: t.score)
-            if round_best.score > best_score:
-                best_score = round_best.score
-                best_trial = round_best
+            # ── Update best ──
+            trial_result = trials[0]
+            if trial_result.score > best_score:
+                best_score = trial_result.score
+                best_trial = trial_result
+                logger.info("[RESULT] Trial %d: NEW BEST %.1f%% (+%.1f%%p over baseline)",
+                            trial_num, best_score, best_score - baseline)
+            else:
+                logger.info("[RESULT] Trial %d: %.1f%% (best remains %.1f%%)",
+                            trial_num, trial_result.score, best_score)
 
-            # 2b-1. Record trials in evolution engine
+            # ── Record in evolution engine ──
             for trial in trials:
                 trial_config = safe_asdict(trial.config) if hasattr(trial.config, '__dataclass_fields__') else {}
                 evolution.record_trial(
@@ -1076,8 +1093,8 @@ class ResearchAgent:
             task_meta = get_task_meta_for_name(task.name)
 
             if task_meta.task_type != "classification":
-                # ── Non-classification R1: model + config sweep ──
-                # Query remote GPU memory if executor supports it
+                # ── Non-classification: LLM-driven single trial design ──
+                # Query remote GPU memory
                 remote_gpu_gb = None
                 if hasattr(self, 'executor') and hasattr(self.executor, 'get_remote_gpu_gb'):
                     try:
@@ -1085,11 +1102,8 @@ class ResearchAgent:
                     except Exception:
                         pass
                 gpu_model = select_model_for_gpu(task_meta, gpu_gb=remote_gpu_gb)
-                base_cfg = dict(task_meta.default_config)
-                base_cfg["base_model"] = gpu_model
 
-                # Auto-determine epochs based on model speed + time budget
-                # Estimated epoch times on L40S for COCO (118K images):
+                # Epoch speed estimates
                 _epoch_minutes = {
                     "yolov8n": 8, "yolov8s": 10, "yolov8m": 12,
                     "yolov8l": 18, "yolov8x": 25,
@@ -1097,76 +1111,69 @@ class ResearchAgent:
                     "yolo11l": 20, "yolo11x": 28,
                     "rtdetr-l": 90, "rtdetr-x": 135,
                 }
-                budget_minutes = 8 * 60  # 8h total
-                num_trials = min(remaining_trials, 4)
-                per_trial_minutes = budget_minutes // max(num_trials, 1)
-                model_speed = _epoch_minutes.get(gpu_model, 20)
-                auto_epochs = max(3, min(80, per_trial_minutes // model_speed))
-                base_cfg["epochs"] = auto_epochs
-                logger.info("R1 auto-epochs: %s → %d epochs (%dmin/ep, %dmin/trial, %d trials)",
-                            gpu_model, auto_epochs, model_speed, per_trial_minutes, num_trials)
 
-                # Build sweep: model variants × augmentation configs
-                trials = []
-                # Trial 1: GPU-optimal model, default config
-                trials.append({**base_cfg, "extra": {"cos_lr": True, "close_mosaic": 10,
-                    "mosaic": 1.0, "mixup": 0.15, "copy_paste": 0.1, "erasing": 0.4}})
+                # Build context for LLM
+                models_info = "\n".join(
+                    f"  {m['name']}: {task_meta.model_ceilings.get(m['name'], '?')}% ceiling, "
+                    f"{m.get('params_m', '?')}M params, ~{_epoch_minutes.get(m['name'], '?')}min/epoch"
+                    for m in task_meta.known_models
+                )
+                prior_results = ""
+                if prior_analysis:
+                    prior_results = "\n".join(prior_analysis[-3:])
 
-                # Trial 2: Same model, higher resolution (fewer epochs due to slower)
-                t2 = {**base_cfg, "img_size": 800,
-                       "batch_size": max(4, base_cfg.get("batch_size", 16) // 2),
-                       "epochs": max(3, auto_epochs * 2 // 3)}
-                t2["extra"] = {"cos_lr": True, "close_mosaic": 10,
-                    "mosaic": 1.0, "mixup": 0.15, "copy_paste": 0.1}
-                trials.append(t2)
+                prompt = (
+                    f"You are a Research Agent designing the next training trial to MAXIMIZE {task.eval_metric}.\n\n"
+                    f"Task: {task.description}\n"
+                    f"GPU: {remote_gpu_gb or 46}GB, Time remaining: ~{8 - (round_num * 2)}h\n"
+                    f"GPU-optimal model: {gpu_model}\n\n"
+                    f"Available models & ceilings:\n{models_info}\n\n"
+                    f"Available techniques: {list(task_meta.technique_catalog.keys())[:20]}\n\n"
+                    f"{upstream_context}\n"
+                    f"Previous results:\n{prior_results or 'No previous trials (this is the first trial)'}\n\n"
+                    f"Design ONE training config that maximizes {task.eval_metric}.\n"
+                    f"Return ONLY JSON: {{\"base_model\": \"...\", \"epochs\": N, \"batch_size\": N, "
+                    f"\"img_size\": N, \"lr\": N, \"optimizer\": \"...\", \"patience\": N, "
+                    f"\"extra\": {{\"cos_lr\": true, \"mosaic\": 1.0, ...}}, "
+                    f"\"reasoning\": \"why this config\"}}"
+                )
 
-                # Trial 3: Lower lr + longer training
-                t3 = {**base_cfg, "lr": 0.005, "epochs": min(auto_epochs * 2, 100)}
-                t3["extra"] = {"cos_lr": True, "close_mosaic": 10,
-                    "mosaic": 1.0, "mixup": 0.2, "copy_paste": 0.2}
-                trials.append(t3)
+                llm_config = safe_llm_call(self.llm, prompt, fallback={})
 
-                # Trial 4: Next larger model (if upgrade path exists)
-                upgrade = task_meta.model_upgrade_path.get(gpu_model)
-                if upgrade:
-                    upgrade_speed = _epoch_minutes.get(upgrade, model_speed * 2)
-                    upgrade_epochs = max(3, per_trial_minutes // upgrade_speed)
-                    t4 = {**base_cfg, "base_model": upgrade, "epochs": upgrade_epochs}
-                    # Adjust batch for larger model
-                    for m in task_meta.known_models:
-                        if m["name"] == upgrade and m.get("params_m", 0) > 40:
-                            t4["batch_size"] = max(4, t4.get("batch_size", 16) // 2)
-                    t4["extra"] = {"cos_lr": True, "close_mosaic": 10,
-                        "mosaic": 1.0, "mixup": 0.15, "copy_paste": 0.1}
-                    trials.append(t4)
+                if isinstance(llm_config, dict) and llm_config.get("base_model"):
+                    # LLM successfully designed a config
+                    reasoning = llm_config.pop("reasoning", "LLM-designed")
+                    # Auto-determine epochs if LLM didn't account for speed
+                    model_name = llm_config.get("base_model", gpu_model)
+                    speed = _epoch_minutes.get(model_name, 20)
+                    max_epochs = max(3, int(120 / speed))  # ~2h per trial
+                    if llm_config.get("epochs", 50) > max_epochs:
+                        llm_config["epochs"] = max_epochs
 
-                for t in trials[:remaining_trials]:
                     tc_fields = {f.name for f in TrialConfig.__dataclass_fields__.values()}
-                    cfg_dict = {k: v for k, v in t.items() if k in tc_fields}
+                    cfg_dict = {k: v for k, v in llm_config.items() if k in tc_fields}
                     configs.append(TrialConfig(**cfg_dict))
 
-                # Log reasoning for each trial config
-                for i, cfg in enumerate(configs):
-                    model_name = cfg.base_model or gpu_model
-                    ceiling = task_meta.model_ceilings.get(model_name, 0)
                     logger.info(
-                        "[REASONING] R1 Trial %d config:\n"
-                        "  Model: %s (ceiling: %.1f%%, params: %sM)\n"
-                        "  Epochs: %d (auto: %dmin/ep × %d ep = %dmin)\n"
-                        "  Resolution: %dpx, Batch: %d, LR: %s\n"
-                        "  Augmentation: %s\n"
+                        "[REASONING] Trial %d config (LLM-designed):\n"
+                        "  Model: %s, Epochs: %d, ImgSize: %d, LR: %s, Batch: %d\n"
                         "  Why: %s",
-                        i + 1, model_name, ceiling,
-                        next((m["params_m"] for m in task_meta.known_models if m["name"] == model_name), "?"),
-                        cfg.epochs, _epoch_minutes.get(model_name, 20), cfg.epochs,
-                        _epoch_minutes.get(model_name, 20) * cfg.epochs,
-                        cfg.img_size, cfg.batch_size, cfg.lr,
-                        cfg.extra if cfg.extra else "default",
-                        ["GPU-optimal baseline", "Higher resolution (small object focus)",
-                         "Lower LR + longer training (convergence)", "Larger model (higher ceiling)"][min(i, 3)],
+                        round_num, model_name, llm_config.get("epochs", 0),
+                        llm_config.get("img_size", 640), llm_config.get("lr", 0.01),
+                        llm_config.get("batch_size", 16), reasoning,
                     )
-                logger.info("R1 non-classification: %d configs for %s (gpu_model=%s)",
-                            len(configs), task_meta.task_type, gpu_model)
+                else:
+                    # LLM fallback: use GPU-optimal model with good defaults
+                    base_cfg = dict(task_meta.default_config)
+                    base_cfg["base_model"] = gpu_model
+                    speed = _epoch_minutes.get(gpu_model, 20)
+                    base_cfg["epochs"] = max(3, int(120 / speed))
+                    base_cfg["extra"] = {"cos_lr": True, "close_mosaic": 10,
+                        "mosaic": 1.0, "mixup": 0.15, "copy_paste": 0.1, "erasing": 0.4}
+                    tc_fields = {f.name for f in TrialConfig.__dataclass_fields__.values()}
+                    configs.append(TrialConfig(**{k: v for k, v in base_cfg.items() if k in tc_fields}))
+                    logger.info("[REASONING] Trial %d config (fallback): %s %d epochs",
+                                round_num, gpu_model, base_cfg["epochs"])
 
             else:
                 # ── Classification R1: v019 SAM-based sweep (unchanged) ──
