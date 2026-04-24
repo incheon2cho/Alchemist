@@ -258,13 +258,20 @@ class BenchmarkAgent:
             result["summary"] = "\n".join(lines)
         else:
             # LLM fallback — ask for estimated SoTA (marks it as LLM-estimated)
+            from alchemist.core.task_registry import get_task_meta_for_name as _get_meta2
+            _meta2 = _get_meta2(task.name)
+            _metric_name = _meta2.eval_metric if _meta2 else "accuracy"
             est = safe_llm_call(
                 self.llm,
                 (
-                    f"What is the reported state-of-the-art Top-1 accuracy on "
+                    f"What is the reported state-of-the-art {_metric_name} on "
                     f"the {task.name} benchmark (as of your training data)? "
-                    f"Return JSON with keys: top_model, top_score_pct, "
-                    f"top_paper_title, year, note."
+                    f"The metric is {_metric_name} (percentage, 0-100). "
+                    f"Return ONLY JSON with keys: top_model, top_score_pct, "
+                    f"top_paper_title, year, note. "
+                    f"Example: {{\"top_model\": \"Co-DETR\", \"top_score_pct\": 66.0, "
+                    f"\"top_paper_title\": \"DETRs with Collaborative...\", \"year\": 2024, "
+                    f"\"note\": \"with Swin-L backbone\"}}"
                 ),
                 fallback={},
             )
