@@ -1904,46 +1904,6 @@ class ResearchAgent:
                 adapted = replace(adapted, batch_size=64)
         return adapted
 
-    @staticmethod
-    def _select_detection_model_for_gpu() -> str:
-        """Select the best detection model based on available GPU memory.
-
-        Larger models have higher mAP ceiling on COCO:
-          yolov8n(37) < yolov8s(45) < yolov8m(50) < yolov8l(53) < yolov8x(54)
-        So always pick the largest model the GPU can handle.
-        """
-        try:
-            import torch
-            if torch.cuda.is_available():
-                total_gb = torch.cuda.get_properties(0).total_memory / 1e9
-            else:
-                total_gb = 0
-        except Exception:
-            total_gb = 0
-
-        if total_gb == 0:
-            logger.info("[det-model] No GPU info available, defaulting to yolov8m")
-            return "yolov8m"
-
-        # Model memory requirements (approximate, including training overhead):
-        #   yolov8x: ~20GB → needs 24GB+ GPU
-        #   yolov8l: ~14GB → needs 16GB+ GPU
-        #   yolov8m: ~8GB  → needs 12GB+ GPU
-        #   yolov8s: ~5GB  → needs 8GB+ GPU
-        if total_gb >= 40:
-            model = "yolov8x"  # L40S(46GB), A100(80GB), H100(80GB)
-        elif total_gb >= 24:
-            model = "yolov8l"  # A10G(24GB), RTX 4090(24GB)
-        elif total_gb >= 16:
-            model = "yolov8m"  # T4(16GB), RTX 4080(16GB)
-        elif total_gb >= 8:
-            model = "yolov8s"  # RTX 3060(8GB)
-        else:
-            model = "yolov8n"
-
-        logger.info("[det-model] GPU %.0fGB → selected %s", total_gb, model)
-        return model
-
     def _adapt_detection_from_results(
         self,
         config: dict,
