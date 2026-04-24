@@ -284,15 +284,18 @@ class BenchmarkAgent:
                     f"(no retrieval source + no LLM estimate)"
                 )
 
+        from alchemist.core.task_registry import get_task_meta_for_name as _get_meta
+        _meta = _get_meta(task.name)
+        _our_ceiling = max(_meta.model_ceilings.values()) if _meta and _meta.model_ceilings else 55.0
+        _sota = result["top_score_pct"] or 0.0
         logger.info(
             "[REASONING] SoTA standing for %s:\n"
             "  Current SoTA: %.2f%% by %s\n"
             "  Source: %s\n"
-            "  Implication: our model ceiling is ~%.1f%% (gap: ~%.1f%%p from SoTA)",
-            task.name, result["top_score_pct"] or 0.0, result["top_model"],
+            "  Implication: our best model ceiling is ~%.1f%% (gap: ~%.1f%%p from SoTA)",
+            task.name, _sota, result["top_model"],
             "PwC archive" if result.get("entries") else "LLM estimation",
-            task_meta.model_ceilings.get(task_meta.known_models[0]["name"], 55) if task_meta and task_meta.known_models else 55,
-            (result["top_score_pct"] or 0) - (task_meta.model_ceilings.get(task_meta.known_models[0]["name"], 55) if task_meta and task_meta.known_models else 55),
+            _our_ceiling, _sota - _our_ceiling,
         )
         return result
 
