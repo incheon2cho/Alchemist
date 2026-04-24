@@ -518,22 +518,60 @@ class SelfEvolutionEngine:
 
     @staticmethod
     def _extract_techniques(config: dict) -> list[str]:
-        """Infer technique names from a config dict."""
+        """Infer technique names from a config dict.
+
+        Extracts from both top-level fields and nested extra dict,
+        supporting classification and detection/seg/pose configs.
+        """
         techs = []
+        extra = config.get("extra", {}) or {}
+
+        # Model identity
         if config.get("base_model"):
             techs.append(config["base_model"])
-        if config.get("extra", {}).get("mosaic", 0) > 0:
+
+        # Detection/seg/pose specific
+        if extra.get("mosaic", 0) > 0:
             techs.append("mosaic_on")
-        if config.get("extra", {}).get("mixup", 0) > 0:
+        if extra.get("mixup", 0) > 0:
             techs.append("mixup_det")
-        if config.get("extra", {}).get("copy_paste", 0) > 0:
+        if extra.get("copy_paste", 0) > 0:
             techs.append("copy_paste")
-        if config.get("extra", {}).get("cos_lr"):
-            techs.append("cosine_lr")
-        if config.get("img_size", 640) > 640:
-            techs.append(f"resolution_{config['img_size']}")
+        if extra.get("cos_lr"):
+            techs.append("cos_lr")
+        if extra.get("erasing", 0) > 0:
+            techs.append("random_erasing_det")
+        if extra.get("multi_scale", 0) > 0:
+            techs.append("multi_scale")
+        if extra.get("freeze") and extra["freeze"] > 0:
+            techs.append(f"freeze_backbone_{extra['freeze']}")
+        for loss_key in ("box", "cls", "dfl"):
+            if extra.get(loss_key):
+                techs.append(f"{loss_key}_loss={extra[loss_key]}")
+
+        # Resolution
+        img_size = config.get("img_size", 0) or extra.get("img_size", 0)
+        if img_size > 640:
+            techs.append(f"resolution_{img_size}")
+
+        # Training duration
         if config.get("epochs", 50) > 50:
             techs.append("long_training")
+
+        # Classification specific
+        if config.get("optimizer") == "sam":
+            techs.append(f"sam_rho={config.get('sam_rho', 0.05)}")
+        if config.get("ema"):
+            techs.append("ema")
+        if config.get("mixup") is True:
+            techs.append("mixup")
+        if config.get("cutmix") is True:
+            techs.append("cutmix")
+        if config.get("randaugment"):
+            techs.append("randaugment")
+        if config.get("adapter") and config["adapter"] != "none":
+            techs.append(f"adapter={config['adapter']}")
+
         return techs if techs else ["baseline"]
 
 
@@ -756,6 +794,30 @@ class ResearchAgent:
             if not configs:
                 self.research_log.record("design", "no_configs_generated", {}, round_num)
                 break
+
+            # 2a-2. Adapt configs based on previous results (non-classification)
+            from alchemist.core.task_registry import get_task_meta_for_name as _get_meta
+            _task_meta = _get_meta(task.name)
+            if _task_meta.task_type != "classification" and round_num > 1 and all_trials:
+                trial_dicts = []
+                for t in all_trials:
+                    td = safe_asdict(t.config) if hasattr(t.config, '__dataclass_fields__') else {}
+                    td["map50_95"] = t.score
+                    td["map50"] = getattr(t, "map50", t.score * 1.3)
+                    td["precision"] = getattr(t, "precision", 70.0)
+                    td["recall"] = getattr(t, "recall", 55.0)
+                    trial_dicts.append(td)
+
+                adapted_configs = []
+                for cfg in configs:
+                    cfg_dict = safe_asdict(cfg)
+                    adapted = self._adapt_detection_from_results(cfg_dict, trial_dicts)
+                    # Rebuild TrialConfig from adapted dict
+                    tc_fields = {f.name for f in TrialConfig.__dataclass_fields__.values()}
+                    adapted_cfg = TrialConfig(**{k: v for k, v in adapted.items() if k in tc_fields})
+                    adapted_configs.append(adapted_cfg)
+                configs = adapted_configs
+                logger.info("[adapt] Applied _adapt_detection_from_results to %d configs", len(configs))
 
             # 2b. Run trials
             trials = self.run_trials(
@@ -1000,97 +1062,114 @@ class ResearchAgent:
         freeze_options = [True] if is_large_model else DEFAULT_FREEZE_OPTIONS
 
         if round_num == 1:
-            # Round 1: broad exploration.
-            # batch_size scales by model size to keep GPU saturated without OOM
-            # on an A10G 24 GB. Small/mid models (< 50M) get 128; large
-            # 50–100M get 64 (safer margin for activations+optimizer states).
-            def _default_batch(params_m: float, freeze: bool) -> int:
-                if freeze:
-                    return 128  # linear probe / no grad on backbone
-                if params_m >= 50:
-                    return 16   # large model + SAM 2-step + EMA + 256px = tight on A10G 24GB
-                return 32
-            params_m = 0.0
-            for name, info in [
-                ("dinov2_vitb14", {"params_m": 86}),
-                ("vit_b16_dino", {"params_m": 86}),
-                ("convnextv2_base", {"params_m": 89}),
-                ("convnext_base", {"params_m": 88}),
-                ("convnext_small", {"params_m": 50}),
-                ("maxvit_tiny", {"params_m": 29}),
-                ("efficientnet", {"params_m": 20}),
-            ]:
-                if name in base_model:
-                    params_m = info["params_m"]
-                    break
-            # R1 grid informed by v019 winning config (94.0% on CIFAR-100):
-            #   SAM(rho=0.05), lr=2e-4, LLRD=0.1, drop_path=0.2, 30ep,
-            #   mlp head, Mixup+CutMix+RandAug, cosine schedule.
-            # We sweep key axes around this anchor + EMA on/off ablation.
-            v019_base = dict(
-                batch_size=_default_batch(params_m, False),
-                weight_decay=0.02,
-                scheduler="cosine",
-                augmentation="advanced",
-                freeze_backbone=False,
-                adapter="linear_head",
-                optimizer="sam",
-                mixup=True, mixup_alpha=0.3,
-                cutmix=True, cutmix_alpha=0.5,
-                randaugment=True, label_smoothing=0.1,
-                warmup_epochs=3,
-            )
-            trials = [
-                # --- v019 exact replica (EMA on) ---
-                {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
-                 "epochs": 30, "ema": True, "ema_decay": 0.9999,
-                 "extra": {"drop_path_rate": 0.2}},
-                # --- v019 exact replica (EMA off) — ablation ---
-                {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
-                 "epochs": 30, "ema": False,
-                 "extra": {"drop_path_rate": 0.2}},
-                # --- rho sweep (LLRD=0.1 fixed, EMA on) ---
-                {**v019_base, "lr": 2e-4, "sam_rho": 0.02, "backbone_lr_scale": 0.1,
-                 "epochs": 30, "ema": True, "ema_decay": 0.9999,
-                 "extra": {"drop_path_rate": 0.2}},
-                {**v019_base, "lr": 2e-4, "sam_rho": 0.1, "backbone_lr_scale": 0.1,
-                 "epochs": 30, "ema": True, "ema_decay": 0.9999,
-                 "extra": {"drop_path_rate": 0.2}},
-                # --- lr sweep (rho=0.05 fixed, EMA on) ---
-                {**v019_base, "lr": 1e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
-                 "epochs": 30, "ema": True, "ema_decay": 0.9999,
-                 "extra": {"drop_path_rate": 0.2}},
-                {**v019_base, "lr": 3e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
-                 "epochs": 30, "ema": True, "ema_decay": 0.9999,
-                 "extra": {"drop_path_rate": 0.2}},
-                # --- LLRD ablation (0.1 vs 0.3 vs 0.7, EMA on) ---
-                {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.3,
-                 "epochs": 30, "ema": True, "ema_decay": 0.9999,
-                 "extra": {"drop_path_rate": 0.2}},
-                {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.7,
-                 "epochs": 30, "ema": True, "ema_decay": 0.9999,
-                 "extra": {"drop_path_rate": 0.2}},
-                # --- drop_path ablation (0.0 vs 0.2 vs 0.3, EMA on) ---
-                {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
-                 "epochs": 30, "ema": True, "ema_decay": 0.9999,
-                 "extra": {"drop_path_rate": 0.0}},
-                {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
-                 "epochs": 30, "ema": True, "ema_decay": 0.9999,
-                 "extra": {"drop_path_rate": 0.3}},
-                # --- EMA decay ablation (0.999 vs 0.9999 vs off) ---
-                {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
-                 "epochs": 30, "ema": True, "ema_decay": 0.999,
-                 "extra": {"drop_path_rate": 0.2}},
-                # --- epochs ablation (20ep EMA on) ---
-                {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
-                 "epochs": 20, "ema": True, "ema_decay": 0.9999,
-                 "extra": {"drop_path_rate": 0.2}},
-            ]
-            for t in trials[:remaining_trials]:
-                configs.append(TrialConfig(**{
-                    k: v for k, v in t.items()
-                    if k in {f.name for f in TrialConfig.__dataclass_fields__.values()}
-                }))
+            # Round 1: broad exploration — task-type-aware.
+            from alchemist.core.task_registry import get_task_meta_for_name, select_model_for_gpu
+            task_meta = get_task_meta_for_name(task.name)
+
+            if task_meta.task_type != "classification":
+                # ── Non-classification R1: model + config sweep ──
+                # GPU-optimal model + smaller/larger variants for comparison
+                gpu_model = select_model_for_gpu(task_meta)
+                base_cfg = dict(task_meta.default_config)
+                base_cfg["base_model"] = gpu_model
+
+                # Build sweep: model variants × augmentation configs
+                trials = []
+                # Trial 1: GPU-optimal model, default config
+                trials.append({**base_cfg, "extra": {"cos_lr": True, "close_mosaic": 10,
+                    "mosaic": 1.0, "mixup": 0.15, "copy_paste": 0.1, "erasing": 0.4}})
+
+                # Trial 2: Same model, higher resolution
+                t2 = {**base_cfg, "img_size": 800,
+                       "batch_size": max(4, base_cfg.get("batch_size", 16) // 2)}
+                t2["extra"] = {"cos_lr": True, "close_mosaic": 10,
+                    "mosaic": 1.0, "mixup": 0.15, "copy_paste": 0.1}
+                trials.append(t2)
+
+                # Trial 3: Lower lr + longer training
+                t3 = {**base_cfg, "lr": 0.005, "epochs": min(100, base_cfg.get("epochs", 50) * 2)}
+                t3["extra"] = {"cos_lr": True, "close_mosaic": 10,
+                    "mosaic": 1.0, "mixup": 0.2, "copy_paste": 0.2}
+                trials.append(t3)
+
+                # Trial 4: Next larger model (if upgrade path exists)
+                upgrade = task_meta.model_upgrade_path.get(gpu_model)
+                if upgrade:
+                    t4 = {**base_cfg, "base_model": upgrade}
+                    # Adjust batch for larger model
+                    for m in task_meta.known_models:
+                        if m["name"] == upgrade and m.get("params_m", 0) > 40:
+                            t4["batch_size"] = max(4, t4.get("batch_size", 16) // 2)
+                    t4["extra"] = {"cos_lr": True, "close_mosaic": 10,
+                        "mosaic": 1.0, "mixup": 0.15, "copy_paste": 0.1}
+                    trials.append(t4)
+
+                for t in trials[:remaining_trials]:
+                    tc_fields = {f.name for f in TrialConfig.__dataclass_fields__.values()}
+                    cfg_dict = {k: v for k, v in t.items() if k in tc_fields}
+                    configs.append(TrialConfig(**cfg_dict))
+
+                logger.info("R1 non-classification: %d configs for %s (gpu_model=%s)",
+                            len(configs), task_meta.task_type, gpu_model)
+
+            else:
+                # ── Classification R1: v019 SAM-based sweep (unchanged) ──
+                def _default_batch(params_m: float, freeze: bool) -> int:
+                    if freeze:
+                        return 128
+                    if params_m >= 50:
+                        return 16
+                    return 32
+                params_m = 0.0
+                for name, info in [
+                    ("dinov2_vitb14", {"params_m": 86}),
+                    ("vit_b16_dino", {"params_m": 86}),
+                    ("convnextv2_base", {"params_m": 89}),
+                    ("convnext_base", {"params_m": 88}),
+                    ("convnext_small", {"params_m": 50}),
+                    ("maxvit_tiny", {"params_m": 29}),
+                    ("efficientnet", {"params_m": 20}),
+                ]:
+                    if name in base_model:
+                        params_m = info["params_m"]
+                        break
+                v019_base = dict(
+                    batch_size=_default_batch(params_m, False),
+                    weight_decay=0.02, scheduler="cosine", augmentation="advanced",
+                    freeze_backbone=False, adapter="linear_head", optimizer="sam",
+                    mixup=True, mixup_alpha=0.3, cutmix=True, cutmix_alpha=0.5,
+                    randaugment=True, label_smoothing=0.1, warmup_epochs=3,
+                )
+                trials = [
+                    {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
+                     "epochs": 30, "ema": True, "ema_decay": 0.9999,
+                     "extra": {"drop_path_rate": 0.2}},
+                    {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
+                     "epochs": 30, "ema": False, "extra": {"drop_path_rate": 0.2}},
+                    {**v019_base, "lr": 2e-4, "sam_rho": 0.02, "backbone_lr_scale": 0.1,
+                     "epochs": 30, "ema": True, "ema_decay": 0.9999,
+                     "extra": {"drop_path_rate": 0.2}},
+                    {**v019_base, "lr": 2e-4, "sam_rho": 0.1, "backbone_lr_scale": 0.1,
+                     "epochs": 30, "ema": True, "ema_decay": 0.9999,
+                     "extra": {"drop_path_rate": 0.2}},
+                    {**v019_base, "lr": 1e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
+                     "epochs": 30, "ema": True, "ema_decay": 0.9999,
+                     "extra": {"drop_path_rate": 0.2}},
+                    {**v019_base, "lr": 3e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.1,
+                     "epochs": 30, "ema": True, "ema_decay": 0.9999,
+                     "extra": {"drop_path_rate": 0.2}},
+                    {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.3,
+                     "epochs": 30, "ema": True, "ema_decay": 0.9999,
+                     "extra": {"drop_path_rate": 0.2}},
+                    {**v019_base, "lr": 2e-4, "sam_rho": 0.05, "backbone_lr_scale": 0.7,
+                     "epochs": 30, "ema": True, "ema_decay": 0.9999,
+                     "extra": {"drop_path_rate": 0.2}},
+                ]
+                for t in trials[:remaining_trials]:
+                    configs.append(TrialConfig(**{
+                        k: v for k, v in t.items()
+                        if k in {f.name for f in TrialConfig.__dataclass_fields__.values()}
+                    }))
         else:
             # Round 2+: LLM-driven advanced-technique refinement.
             # Use suggest_techniques() to get configs with SAM/Mixup/CutMix/EMA
@@ -1422,9 +1501,9 @@ class ResearchAgent:
             f"Task: {task.name}, current best: {current_best:.2f}%\n"
             f"Available untried techniques: {catalog_menu}\n\n"
             f"Recent analysis:\n{history_summary[:500]}\n\n"
-            f"Return ONLY a JSON array. Each config: lr, batch_size, epochs, "
-            f"freeze_backbone, adapter, optimizer ('sam'/'adamw'), sam_rho, "
-            f"mixup, cutmix, techniques (list of technique names from above).\n"
+            f"Return ONLY a JSON array. Each config should have: "
+            f"{'base_model, img_size, lr, batch_size, epochs, optimizer, patience, techniques' if is_detection else 'lr, batch_size, epochs, freeze_backbone, adapter, optimizer, sam_rho, mixup, cutmix, techniques'} "
+            f"(techniques = list of technique names from above).\n"
             f"Focus on COMBINATIONS of untried techniques."
         )
         llm_configs = safe_llm_call(self.llm, prompt, fallback=[])
@@ -1466,41 +1545,72 @@ class ResearchAgent:
         # Sort trials by score for analysis
         sorted_trials = sorted(all_trials, key=lambda t: t.score, reverse=True)
 
-        trials_detail = "\n".join(
-            f"  Trial {t.trial_id}: lr={t.config.lr}, bs={t.config.batch_size}, "
-            f"freeze={t.config.freeze_backbone}, adapter={t.config.adapter}, "
-            f"epochs={t.config.epochs} → score={t.score:.2f}%"
-            for t in sorted_trials[:10]
-        )
+        # Task-type-aware analysis dimensions
+        from alchemist.core.task_registry import get_task_meta_for_name
+        task_meta = get_task_meta_for_name(task.name)
+        is_cls = task_meta.task_type == "classification"
 
-        # Group by key dimensions for pattern analysis
-        freeze_scores = {}
-        adapter_scores = {}
-        lr_scores = {}
-        for t in all_trials:
-            freeze_scores.setdefault(t.config.freeze_backbone, []).append(t.score)
-            adapter_scores.setdefault(t.config.adapter, []).append(t.score)
-            lr_scores.setdefault(t.config.lr, []).append(t.score)
+        if is_cls:
+            trials_detail = "\n".join(
+                f"  Trial {t.trial_id}: lr={t.config.lr}, bs={t.config.batch_size}, "
+                f"freeze={t.config.freeze_backbone}, adapter={t.config.adapter}, "
+                f"epochs={t.config.epochs} → score={t.score:.2f}%"
+                for t in sorted_trials[:10]
+            )
+            dim_groups: dict[str, dict] = {
+                "freeze": {}, "adapter": {}, "lr": {},
+            }
+            for t in all_trials:
+                dim_groups["freeze"].setdefault(t.config.freeze_backbone, []).append(t.score)
+                dim_groups["adapter"].setdefault(t.config.adapter, []).append(t.score)
+                dim_groups["lr"].setdefault(t.config.lr, []).append(t.score)
+            analysis_questions = (
+                "1. Which hyperparameters contributed most to performance?\n"
+                "2. What patterns do you see? (e.g., lower LR is better, frozen backbone helps)\n"
+                "3. Are there unexplored promising directions?\n"
+            )
+        else:
+            # Detection/segmentation/pose: analyze model, img_size, lr, epochs
+            trials_detail = "\n".join(
+                f"  Trial {t.trial_id}: model={t.config.base_model}, "
+                f"img_size={t.config.img_size}, lr={t.config.lr}, "
+                f"bs={t.config.batch_size}, epochs={t.config.epochs} → "
+                f"score={t.score:.2f}%"
+                for t in sorted_trials[:10]
+            )
+            dim_groups = {
+                "base_model": {}, "img_size": {}, "lr": {}, "epochs": {},
+            }
+            for t in all_trials:
+                dim_groups["base_model"].setdefault(t.config.base_model, []).append(t.score)
+                dim_groups["img_size"].setdefault(t.config.img_size, []).append(t.score)
+                dim_groups["lr"].setdefault(t.config.lr, []).append(t.score)
+                dim_groups["epochs"].setdefault(t.config.epochs, []).append(t.score)
+            analysis_questions = (
+                "1. Which model architecture performed best? Should we try a larger model?\n"
+                "2. Does higher resolution improve mAP? Is the GPU memory trade-off worth it?\n"
+                "3. Are there augmentation or loss tuning opportunities unexplored?\n"
+            )
 
         pattern_summary = "Score patterns:\n"
-        for key, label in [(freeze_scores, "freeze"), (adapter_scores, "adapter"), (lr_scores, "lr")]:
-            for k, scores in key.items():
+        for label, group in dim_groups.items():
+            for k, scores in group.items():
                 avg = sum(scores) / len(scores)
                 pattern_summary += f"  {label}={k}: avg={avg:.2f}%, n={len(scores)}\n"
 
         prompt = (
             f"You are a Research Agent analyzing experiment results (round {round_num}).\n\n"
+            f"Task type: {task_meta.task_type}\n"
             f"Base model: {base_model}\n"
             f"Task: {task.description} ({task.num_classes} classes)\n"
+            f"Metric: {task_meta.eval_metric}\n"
             f"Baseline: {baseline:.2f}%\n"
             f"Current best: {current_best:.2f}% (+{current_best - baseline:.2f}%)\n"
             f"Total trials so far: {len(all_trials)}\n\n"
             f"All trial results (sorted by score):\n{trials_detail}\n\n"
             f"{pattern_summary}\n"
             f"Analyze:\n"
-            f"1. Which hyperparameters contributed most to performance?\n"
-            f"2. What patterns do you see? (e.g., lower LR is better, frozen backbone helps)\n"
-            f"3. Are there unexplored promising directions?\n"
+            f"{analysis_questions}"
             f"4. What should the next round focus on?\n"
             f"5. Is there still meaningful room for improvement, or are we near optimal?\n\n"
             f"Be concise and actionable (3-5 sentences)."

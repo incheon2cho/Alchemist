@@ -209,6 +209,14 @@ class AWSExecutor(TrainingExecutor):
         return self._submit_and_wait(job, early_stop_fn=early_stop_fn)
 
     def evaluate_baseline(self, base_model: str, task: UserTask) -> float:
+        # Use task-appropriate defaults from TaskRegistry
+        from alchemist.core.task_registry import get_task_meta_for_name
+        task_meta = get_task_meta_for_name(task.name)
+        baseline_config = dict(task_meta.default_config) if task_meta.default_config else {}
+        baseline_config["base_model"] = base_model
+        # Short baseline: fewer epochs for quick eval
+        baseline_config["epochs"] = min(baseline_config.get("epochs", 10), 10)
+
         job = {
             "command": "baseline",
             "trial_id": 0,
@@ -220,7 +228,7 @@ class AWSExecutor(TrainingExecutor):
                 "num_classes": task.num_classes,
                 "eval_metric": task.eval_metric,
             },
-            "config": asdict(TrialConfig()),
+            "config": baseline_config,
         }
         result = self._submit_and_wait(job)
         return result.score

@@ -84,6 +84,10 @@ class TrialConfig:
     warmup_epochs: int = 0
     backbone_lr_scale: float = 1.0        # LLRD (layer-wise LR decay)
     sam_rho: float = 0.05
+    # Universal fields (used by detection/segmentation/pose workers)
+    img_size: int = 224
+    patience: int = 10
+    base_model: str = ""                  # model name for detection/seg/pose
     extra: dict[str, Any] = field(default_factory=dict)
 
 
