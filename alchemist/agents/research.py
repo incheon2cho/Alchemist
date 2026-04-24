@@ -1068,10 +1068,27 @@ class ResearchAgent:
 
             if task_meta.task_type != "classification":
                 # ── Non-classification R1: model + config sweep ──
-                # GPU-optimal model + smaller/larger variants for comparison
                 gpu_model = select_model_for_gpu(task_meta)
                 base_cfg = dict(task_meta.default_config)
                 base_cfg["base_model"] = gpu_model
+
+                # Auto-determine epochs based on model speed + time budget
+                # Estimated epoch times on L40S for COCO (118K images):
+                _epoch_minutes = {
+                    "yolov8n": 8, "yolov8s": 10, "yolov8m": 12,
+                    "yolov8l": 18, "yolov8x": 25,
+                    "yolo11n": 8, "yolo11s": 10, "yolo11m": 14,
+                    "yolo11l": 20, "yolo11x": 28,
+                    "rtdetr-l": 90, "rtdetr-x": 135,
+                }
+                budget_minutes = 8 * 60  # 8h total
+                num_trials = min(remaining_trials, 4)
+                per_trial_minutes = budget_minutes // max(num_trials, 1)
+                model_speed = _epoch_minutes.get(gpu_model, 20)
+                auto_epochs = max(3, min(80, per_trial_minutes // model_speed))
+                base_cfg["epochs"] = auto_epochs
+                logger.info("R1 auto-epochs: %s → %d epochs (%dmin/ep, %dmin/trial, %d trials)",
+                            gpu_model, auto_epochs, model_speed, per_trial_minutes, num_trials)
 
                 # Build sweep: model variants × augmentation configs
                 trials = []
@@ -1079,15 +1096,16 @@ class ResearchAgent:
                 trials.append({**base_cfg, "extra": {"cos_lr": True, "close_mosaic": 10,
                     "mosaic": 1.0, "mixup": 0.15, "copy_paste": 0.1, "erasing": 0.4}})
 
-                # Trial 2: Same model, higher resolution
+                # Trial 2: Same model, higher resolution (fewer epochs due to slower)
                 t2 = {**base_cfg, "img_size": 800,
-                       "batch_size": max(4, base_cfg.get("batch_size", 16) // 2)}
+                       "batch_size": max(4, base_cfg.get("batch_size", 16) // 2),
+                       "epochs": max(3, auto_epochs * 2 // 3)}
                 t2["extra"] = {"cos_lr": True, "close_mosaic": 10,
                     "mosaic": 1.0, "mixup": 0.15, "copy_paste": 0.1}
                 trials.append(t2)
 
                 # Trial 3: Lower lr + longer training
-                t3 = {**base_cfg, "lr": 0.005, "epochs": min(100, base_cfg.get("epochs", 50) * 2)}
+                t3 = {**base_cfg, "lr": 0.005, "epochs": min(auto_epochs * 2, 100)}
                 t3["extra"] = {"cos_lr": True, "close_mosaic": 10,
                     "mosaic": 1.0, "mixup": 0.2, "copy_paste": 0.2}
                 trials.append(t3)
@@ -1095,7 +1113,9 @@ class ResearchAgent:
                 # Trial 4: Next larger model (if upgrade path exists)
                 upgrade = task_meta.model_upgrade_path.get(gpu_model)
                 if upgrade:
-                    t4 = {**base_cfg, "base_model": upgrade}
+                    upgrade_speed = _epoch_minutes.get(upgrade, model_speed * 2)
+                    upgrade_epochs = max(3, per_trial_minutes // upgrade_speed)
+                    t4 = {**base_cfg, "base_model": upgrade, "epochs": upgrade_epochs}
                     # Adjust batch for larger model
                     for m in task_meta.known_models:
                         if m["name"] == upgrade and m.get("params_m", 0) > 40:

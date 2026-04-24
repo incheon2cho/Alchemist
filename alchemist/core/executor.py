@@ -132,7 +132,7 @@ class AWSExecutor(TrainingExecutor):
         host: str,
         key_path: str | None = None,
         remote_work_dir: str = "/home/ubuntu/alchemist",
-        remote_python: str = "python",
+        remote_python: str = "python3",
         poll_interval: int = 10,
         ssh_timeout: int = 10,
     ):
@@ -214,8 +214,23 @@ class AWSExecutor(TrainingExecutor):
         task_meta = get_task_meta_for_name(task.name)
         baseline_config = dict(task_meta.default_config) if task_meta.default_config else {}
         baseline_config["base_model"] = base_model
-        # Short baseline: fewer epochs for quick eval
-        baseline_config["epochs"] = min(baseline_config.get("epochs", 10), 10)
+        # Auto-determine baseline epochs based on model size and estimated speed.
+        # Goal: baseline should complete in ~30 minutes max.
+        # Estimated epoch times on L40S for COCO (118K images):
+        #   yolov8n/s: ~8min, yolov8m: ~12min, yolov8l: ~18min, yolov8x: ~25min
+        #   yolo11*: similar to yolov8, rtdetr-l: ~90min, rtdetr-x: ~135min
+        model_lower = base_model.lower()
+        if "rtdetr" in model_lower:
+            baseline_epochs = 1  # RT-DETR: 1.5-2h/epoch, 1 epoch is enough for baseline
+        elif any(s in model_lower for s in ("11x", "8x")):
+            baseline_epochs = 2  # Large YOLO: ~25min/epoch
+        elif any(s in model_lower for s in ("11l", "8l")):
+            baseline_epochs = 2  # Medium-large: ~18min/epoch
+        else:
+            baseline_epochs = 3  # Small/medium models: quick
+        baseline_config["epochs"] = baseline_epochs
+        logger.info("Baseline: %s → %d epochs (auto-determined by model size)",
+                     base_model, baseline_epochs)
 
         job = {
             "command": "baseline",
