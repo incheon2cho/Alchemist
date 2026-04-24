@@ -145,15 +145,14 @@ class AWSExecutor(TrainingExecutor):
 
     @staticmethod
     def _select_worker(job: dict) -> str:
-        """Select the appropriate worker script based on task type."""
-        task_name = job.get("task", {}).get("name", "").lower()
-        if task_name in ("llava_video_178k", "video_mme_v2", "vlm_training"):
-            return "vlm_worker.py"
-        if task_name in ("ucf101", "hmdb51", "kinetics", "ssv2", "diving48"):
-            return "video_worker.py"
-        if task_name in ("coco", "coco_detection", "voc", "objects365"):
-            return "detection_worker.py"
-        return "train_worker.py"
+        """Select the appropriate worker script based on task type.
+
+        Uses the centralized TaskRegistry to resolve task_name → worker_script.
+        """
+        from alchemist.core.task_registry import get_task_meta_for_name
+        task_name = job.get("task", {}).get("name", "")
+        meta = get_task_meta_for_name(task_name)
+        return meta.worker_script
 
     def _ssh_cmd(self, command: str, timeout: int | None = None) -> subprocess.CompletedProcess:
         """Run a command on the remote host via SSH."""

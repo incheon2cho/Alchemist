@@ -191,7 +191,15 @@ DETECTION_TECHNIQUE_CATALOG: dict[str, dict] = {
 
 
 def get_technique_catalog(task_type: str = "classification") -> dict[str, dict]:
-    """Return the appropriate technique catalog based on task type."""
+    """Return the appropriate technique catalog based on task type.
+
+    Prefers TaskRegistry catalog; falls back to legacy module-level dicts.
+    """
+    from alchemist.core.task_registry import get_task_meta_for_name
+    meta = get_task_meta_for_name(task_type)
+    if meta.technique_catalog:
+        return meta.technique_catalog
+    # Legacy fallback
     if task_type in ("detection", "coco_detection", "object_detection"):
         return DETECTION_TECHNIQUE_CATALOG
     return VISION_TECHNIQUE_CATALOG
@@ -1357,18 +1365,23 @@ class ResearchAgent:
         )
 
         # 2. Compose concrete configs from untried techniques
-        if is_detection:
-            base_config = {
-                "base_model": "yolov8m", "batch_size": 16, "epochs": 50,
-                "img_size": 640, "lr": 0.01, "optimizer": "auto",
-                "augmentation": "advanced", "patience": 10,
-                "device": "0", "workers": 4,
-            }
-            priority_techs = [
-                "yolo11m", "rtdetr_l", "resolution_800",
-                "long_training", "copy_paste", "mixup_det",
-                "lr_low", "freeze_backbone_10", "multi_scale",
-            ]
+        #    Use TaskRegistry for task-appropriate defaults
+        from alchemist.core.task_registry import get_task_meta_for_name, select_model_for_gpu
+        task_meta = get_task_meta_for_name(task_type)
+
+        if task_meta.task_type != "classification":
+            # Non-classification: use registry defaults + GPU-optimal model
+            base_config = dict(task_meta.default_config)
+            gpu_model = select_model_for_gpu(task_meta)
+            if gpu_model:
+                base_config["base_model"] = gpu_model
+                # Adjust batch size for larger models
+                for m in task_meta.known_models:
+                    if m["name"] == gpu_model and m.get("params_m", 0) > 40:
+                        base_config["batch_size"] = max(4, base_config.get("batch_size", 16) // 2)
+                        base_config["epochs"] = max(base_config.get("epochs", 50), 80)
+                        break
+            priority_techs = list(task_meta.default_priority_techs)
         else:
             base_config = {
                 "lr": 1e-4, "batch_size": 32, "epochs": 20,
@@ -1646,6 +1659,46 @@ class ResearchAgent:
                 adapted = replace(adapted, batch_size=64)
         return adapted
 
+    @staticmethod
+    def _select_detection_model_for_gpu() -> str:
+        """Select the best detection model based on available GPU memory.
+
+        Larger models have higher mAP ceiling on COCO:
+          yolov8n(37) < yolov8s(45) < yolov8m(50) < yolov8l(53) < yolov8x(54)
+        So always pick the largest model the GPU can handle.
+        """
+        try:
+            import torch
+            if torch.cuda.is_available():
+                total_gb = torch.cuda.get_properties(0).total_memory / 1e9
+            else:
+                total_gb = 0
+        except Exception:
+            total_gb = 0
+
+        if total_gb == 0:
+            logger.info("[det-model] No GPU info available, defaulting to yolov8m")
+            return "yolov8m"
+
+        # Model memory requirements (approximate, including training overhead):
+        #   yolov8x: ~20GB → needs 24GB+ GPU
+        #   yolov8l: ~14GB → needs 16GB+ GPU
+        #   yolov8m: ~8GB  → needs 12GB+ GPU
+        #   yolov8s: ~5GB  → needs 8GB+ GPU
+        if total_gb >= 40:
+            model = "yolov8x"  # L40S(46GB), A100(80GB), H100(80GB)
+        elif total_gb >= 24:
+            model = "yolov8l"  # A10G(24GB), RTX 4090(24GB)
+        elif total_gb >= 16:
+            model = "yolov8m"  # T4(16GB), RTX 4080(16GB)
+        elif total_gb >= 8:
+            model = "yolov8s"  # RTX 3060(8GB)
+        else:
+            model = "yolov8n"
+
+        logger.info("[det-model] GPU %.0fGB → selected %s", total_gb, model)
+        return model
+
     def _adapt_detection_from_results(
         self,
         config: dict,
@@ -1685,9 +1738,21 @@ class ResearchAgent:
             adapted["extra"]["conf"] = 0.35
             adapted["extra"]["cls"] = min(2.0, adapted["extra"].get("cls", 0.5) + 0.5)
 
-        # Low mAP overall → need more capacity or training
-        if map50_95 < 40:
-            logger.info("[det-refine] Low mAP (%.1f%%) → increase capacity", map50_95)
+        # mAP below model's ceiling → try larger model for higher ceiling
+        # Published COCO pretrained mAP50-95 ceilings:
+        #   yolov8m=50.2, yolov8l=52.9, yolov8x=53.9, rtdetr-l=53.0, rtdetr-x=54.8
+        model_ceiling = {
+            "yolov8n": 37.3, "yolov8s": 44.9, "yolov8m": 50.2,
+            "yolov8l": 52.9, "yolov8x": 53.9,
+            "yolo11m": 51.5, "yolo11l": 53.4, "yolo11x": 54.7,
+            "rtdetr-l": 53.0, "rtdetr-x": 54.8,
+        }
+        current_model = adapted.get("base_model", "yolov8m")
+        ceiling = model_ceiling.get(current_model, 50.0)
+        # Upgrade if we're within 5% of model ceiling (diminishing returns)
+        if map50_95 > ceiling * 0.90:
+            logger.info("[det-refine] mAP %.1f%% near ceiling %.1f%% for %s → upgrade model",
+                        map50_95, ceiling, current_model)
             # Try larger model
             model_upgrade = {
                 "yolov8n": "yolov8s", "yolov8s": "yolov8m",

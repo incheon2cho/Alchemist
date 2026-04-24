@@ -127,31 +127,47 @@ class ThreeAgentHarness:
         valid, reason = self.controller.validate_recommendation(leaderboard, task)
         logger.info("Recommendation validation: %s — %s", valid, reason)
 
-        import timm as _timm
-        known_models = set(_timm.list_models())
+        # Resolve model candidates — framework-aware (not just timm)
+        from alchemist.core.task_registry import get_task_meta_for_name
+        task_meta = get_task_meta_for_name(task.name)
 
         def _resolve_model_id(name: str) -> str | None:
-            """Resolve model name across timm, torch.hub, and GitHub."""
-            cand = name.replace("timm/", "", 1)
-            # 1. timm direct match
-            if cand in known_models:
-                return cand
-            if cand.split(".")[0] in known_models:
-                return cand.split(".")[0]
-            # 2. Multi-source check via ModelLoader
-            try:
-                from alchemist.core.model_loader import ModelLoader
-                info = ModelLoader.resolve_model_info(cand)
-                if info.get("loadable"):
-                    logger.info(
-                        "Model '%s' resolvable via %s", cand, info["source"],
-                    )
-                    return cand
-            except ImportError:
-                pass
-            return None
+            """Resolve model name via task-appropriate framework."""
+            if task_meta.model_framework == "ultralytics":
+                # ultralytics models: accept known model names directly
+                known_ultra = {m["name"] for m in task_meta.known_models}
+                if name in known_ultra:
+                    return name
+                return None
+            elif task_meta.model_framework in ("transformers", "torch_hub"):
+                # Accept model names from registry directly
+                known_names = {m["name"] for m in task_meta.known_models}
+                if name in known_names:
+                    return name
+                return None
+            else:
+                # timm-based classification
+                try:
+                    import timm as _timm
+                    known_timm = set(_timm.list_models())
+                    cand = name.replace("timm/", "", 1)
+                    if cand in known_timm:
+                        return cand
+                    if cand.split(".")[0] in known_timm:
+                        return cand.split(".")[0]
+                except ImportError:
+                    pass
+                # Multi-source fallback
+                try:
+                    from alchemist.core.model_loader import ModelLoader
+                    info = ModelLoader.resolve_model_info(name)
+                    if info.get("loadable"):
+                        return name
+                except (ImportError, Exception):
+                    pass
+                return None
 
-        # Build list of top-K timm-resolvable + compliant candidates
+        # Build list of top-K resolvable + compliant candidates
         candidate_names: list[str] = list(leaderboard.candidates) or ([leaderboard.recommendation] if leaderboard.recommendation else [])
         resolved_candidates: list[str] = []
         for name in candidate_names:
@@ -168,11 +184,16 @@ class ThreeAgentHarness:
                     resolved_candidates.append(tid)
                 if len(resolved_candidates) >= 3:
                     break
+        # Framework-aware fallback
         if not resolved_candidates:
-            resolved_candidates = ["convnext_base.fb_in1k"]
+            if task_meta.known_models:
+                resolved_candidates = [task_meta.known_models[0]["name"]]
+            else:
+                resolved_candidates = ["convnext_base.fb_in1k"]
 
-        # Top-K baseline evaluation: pick the best-performing model for Research Agent
-        if len(resolved_candidates) > 1:
+        # Top-K baseline evaluation for classification tasks
+        # For detection/segmentation/pose, skip baseline eval (pretrained scores are known)
+        if task_meta.model_framework == "timm" and len(resolved_candidates) > 1:
             logger.info(
                 "Evaluating %d candidates via quick baseline: %s",
                 len(resolved_candidates), resolved_candidates,
@@ -189,7 +210,10 @@ class ThreeAgentHarness:
             logger.info("Winner: %s (%.2f%%)", best_model, best_score)
             base_model = best_model
         else:
+            # Non-classification: use leaderboard top-ranked model directly
             base_model = resolved_candidates[0]
+            logger.info("Using top-ranked model: %s (framework=%s)",
+                        base_model, task_meta.model_framework)
 
         # Phase 2: Research (Research Agent handles its own iteration loop)
         self.state.phase = "researching"

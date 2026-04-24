@@ -44,6 +44,38 @@ KNOWN_MODELS = [
     {"name": "mvitv2_tiny", "backend": "timm", "model_id": "mvitv2_tiny.fb_in1k", "params_m": 24, "img_size": 224},
 ]
 
+# Detection-specific models — used when task is object detection
+KNOWN_DETECTION_MODELS: list[dict[str, Any]] = [
+    {"name": "yolov8n",  "backend": "ultralytics", "model_id": "yolov8n.pt",  "params_m": 3,   "img_size": 640},
+    {"name": "yolov8s",  "backend": "ultralytics", "model_id": "yolov8s.pt",  "params_m": 11,  "img_size": 640},
+    {"name": "yolov8m",  "backend": "ultralytics", "model_id": "yolov8m.pt",  "params_m": 26,  "img_size": 640},
+    {"name": "yolov8l",  "backend": "ultralytics", "model_id": "yolov8l.pt",  "params_m": 44,  "img_size": 640},
+    {"name": "yolov8x",  "backend": "ultralytics", "model_id": "yolov8x.pt",  "params_m": 68,  "img_size": 640},
+    {"name": "yolo11n",  "backend": "ultralytics", "model_id": "yolo11n.pt",  "params_m": 3,   "img_size": 640},
+    {"name": "yolo11s",  "backend": "ultralytics", "model_id": "yolo11s.pt",  "params_m": 10,  "img_size": 640},
+    {"name": "yolo11m",  "backend": "ultralytics", "model_id": "yolo11m.pt",  "params_m": 20,  "img_size": 640},
+    {"name": "yolo11l",  "backend": "ultralytics", "model_id": "yolo11l.pt",  "params_m": 26,  "img_size": 640},
+    {"name": "yolo11x",  "backend": "ultralytics", "model_id": "yolo11x.pt",  "params_m": 57,  "img_size": 640},
+    {"name": "rtdetr-l",  "backend": "ultralytics", "model_id": "rtdetr-l.pt",  "params_m": 32,  "img_size": 640},
+    {"name": "rtdetr-x",  "backend": "ultralytics", "model_id": "rtdetr-x.pt",  "params_m": 65,  "img_size": 640},
+]
+
+# Published COCO val2017 mAP scores (pretrained weights)
+PUBLISHED_DETECTION_SCORES: dict[str, dict[str, float]] = {
+    "yolov8n":   {"mAP50": 52.6, "mAP50_95": 37.3},
+    "yolov8s":   {"mAP50": 61.8, "mAP50_95": 44.9},
+    "yolov8m":   {"mAP50": 67.2, "mAP50_95": 50.2},
+    "yolov8l":   {"mAP50": 69.8, "mAP50_95": 52.9},
+    "yolov8x":   {"mAP50": 71.0, "mAP50_95": 53.9},
+    "yolo11n":   {"mAP50": 53.4, "mAP50_95": 39.5},
+    "yolo11s":   {"mAP50": 62.5, "mAP50_95": 47.0},
+    "yolo11m":   {"mAP50": 68.1, "mAP50_95": 51.5},
+    "yolo11l":   {"mAP50": 69.4, "mAP50_95": 53.4},
+    "yolo11x":   {"mAP50": 70.6, "mAP50_95": 54.7},
+    "rtdetr-l":  {"mAP50": 71.4, "mAP50_95": 53.0},
+    "rtdetr-x":  {"mAP50": 72.8, "mAP50_95": 54.8},
+}
+
 # NOTE: DINOv2 models default to 518px input but can run at 224px.
 # When using timm, pass img_size=224 to timm.create_model() to override.
 # e.g. timm.create_model(model_id, pretrained=True, img_size=224)
@@ -105,8 +137,17 @@ class BenchmarkAgent:
         payload = msg.payload
         benchmarks = payload.get("benchmarks", ["linear_probe", "knn"])
 
-        # 1. Scout models (task-aware: seeds with PwC + HF Hub)
-        models = self.scout_models(payload.get("search_query", "vision encoder"), task=task)
+        # Use TaskRegistry to determine task-appropriate benchmarks
+        from alchemist.core.task_registry import get_task_meta_for_name
+        task_meta = get_task_meta_for_name(task.name) if task else None
+        if task_meta and task_meta.benchmark_metrics:
+            benchmarks = task_meta.benchmark_metrics
+
+        # 1. Scout models (task-aware: seeds from registry)
+        search_query = payload.get("search_query", "vision encoder")
+        if task_meta and task_meta.task_type != "classification":
+            search_query = f"{task_meta.task_type} {' '.join(m['name'] for m in task_meta.known_models[:3])}"
+        models = self.scout_models(search_query, task=task)
 
         # 2. Run benchmarks (PwC actual scores when available, else estimated)
         scored_models = self.run_benchmarks(models, benchmarks, task=task)
@@ -297,11 +338,19 @@ class BenchmarkAgent:
                 logger.info("PwC scout for '%s': +%d SoTA entries", task.name, len(pwc_hits))
                 pwc_evidence = self.hf.summarize_leaderboard_for_llm(pwc_hits, max_chars=1500)
 
-        # 2. Curated seeds (always included as safety net)
-        for m in KNOWN_MODELS:
+        # 2. Curated seeds from TaskRegistry (task-type-aware)
+        from alchemist.core.task_registry import get_task_meta_for_name
+        task_meta = get_task_meta_for_name(task.name) if task else None
+        seed_models = task_meta.known_models if task_meta else KNOWN_MODELS
+        for m in seed_models:
             if m["name"] not in seen:
                 models.append({**m, "source": m.get("source", "known")})
                 seen.add(m["name"])
+        # Attach published scores from registry
+        if task_meta and task_meta.published_scores:
+            for m in models:
+                if m["name"] in task_meta.published_scores:
+                    m["published_scores"] = task_meta.published_scores[m["name"]]
 
         # 3. HF Hub live discovery (pretrain-source-filtered + timm real top1 scoring)
         hub_evidence = "(retrieval disabled)"
@@ -347,8 +396,9 @@ class BenchmarkAgent:
         arxiv_evidence = ""
         if task and self.arxiv is not None:
             try:
+                arxiv_query = f"{task.name} {task_meta.task_type if task_meta else 'vision'} SoTA" if task_meta else f"{task.name} image classification SoTA"
                 papers = self.arxiv.search(
-                    f"{task.name} image classification SoTA",
+                    arxiv_query,
                     years=[2023, 2024, 2025],
                     top_k=5,
                 )
@@ -428,6 +478,12 @@ class BenchmarkAgent:
     }
 
     def _task_to_pwc_aliases(self, task_name: str) -> list[str]:
+        # First check TaskRegistry for dataset_aliases
+        from alchemist.core.task_registry import get_task_meta_for_name
+        task_meta = get_task_meta_for_name(task_name)
+        if task_meta and task_meta.dataset_aliases:
+            return task_meta.dataset_aliases
+
         key = (task_name or "").lower().replace("-", "").replace("_", "")
         for k, aliases in self._PWC_ALIASES.items():
             if k.replace("_", "") == key:
@@ -508,8 +564,18 @@ class BenchmarkAgent:
                 pwc_score = model.get("pwc_score_pct")
                 for bench in benchmarks:
                     scores[bench] = pwc_score if pwc_score is not None else self._simulate_score(bench)
+            elif model.get("published_scores"):
+                # 3a. Model with published scores from registry
+                pub = model["published_scores"]
+                for bench in benchmarks:
+                    scores[bench] = pub.get(bench, self._simulate_score(bench))
+            elif name in PUBLISHED_DETECTION_SCORES:
+                # 3b. Detection model with published COCO mAP
+                det_scores = PUBLISHED_DETECTION_SCORES[name]
+                for bench in benchmarks:
+                    scores[bench] = det_scores.get(bench, det_scores.get("mAP50_95", self._simulate_score(bench)))
             elif name in PUBLISHED_SCORES:
-                # 3. Seed model with hardcoded score
+                # 3c. Seed model with hardcoded score
                 published = PUBLISHED_SCORES[name]
                 for bench in benchmarks:
                     scores[bench] = published.get(bench, self._simulate_score(bench))
@@ -533,7 +599,7 @@ class BenchmarkAgent:
             model_src = model.get("source", "")
             if model_src in ("huggingface", "pwc"):
                 src = model_src
-            elif model["name"] in PUBLISHED_SCORES:
+            elif model["name"] in PUBLISHED_DETECTION_SCORES or model["name"] in PUBLISHED_SCORES:
                 src = "published"
             elif model_src == "known":
                 src = "known"

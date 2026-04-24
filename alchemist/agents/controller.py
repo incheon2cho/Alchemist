@@ -199,32 +199,39 @@ class ControllerAgent:
         Returns ``(keep, reason)``.
         """
         epoch = int(progress.get("epoch", 0))
-        val = float(progress.get("val_acc", 0.0))
+        # Use task-appropriate metric: val_acc for classification, mAP for detection, etc.
+        val = float(
+            progress.get("val_acc", 0.0)
+            or progress.get("map50_95", 0.0)
+            or progress.get("mAP", 0.0)
+            or progress.get("mIoU", 0.0)
+            or progress.get("score", 0.0)
+        )
         train_loss = float(progress.get("train_loss", 0.0))
         total = int(progress.get("total_epochs", 10))
 
         # Rule (1): catastrophic forgetting — only after warmup has ended.
-        if epoch >= 3 and val < baseline_score - 10.0:
+        if epoch >= 3 and baseline_score > 0 and val < baseline_score - 10.0:
             return False, (
-                f"epoch {epoch}/{total}: val={val:.1f}% is > 10 %p below pretrain "
+                f"epoch {epoch}/{total}: metric={val:.1f}% is > 10 %p below "
                 f"baseline {baseline_score:.1f}% — catastrophic forgetting"
             )
 
         # Rule (2): hopeless — can't close gap to best_so_far in remaining epochs.
         if best_so_far > 0 and epoch >= 5 and val > 0 and val + 5.0 < best_so_far:
             return False, (
-                f"epoch {epoch}/{total}: val={val:.1f}% still > 5 %p below "
+                f"epoch {epoch}/{total}: metric={val:.1f}% still > 5 %p below "
                 f"best_so_far {best_so_far:.1f}% — hopeless"
             )
 
-        # Rule (3): optimizer divergence (classifier CE loss).
+        # Rule (3): optimizer divergence.
         if epoch >= 3 and train_loss > 3.0:
             return False, (
                 f"epoch {epoch}/{total}: train_loss={train_loss:.2f} "
                 f"> 3.0 — optimizer divergence"
             )
 
-        return True, f"continue (epoch {epoch}/{total}, val={val:.1f}%)"
+        return True, f"continue (epoch {epoch}/{total}, metric={val:.1f}%)"
 
     # ------------------------------------------------------------------
     # Ship judgment (기준 기반, 세부 분석은 Research가 담당)
