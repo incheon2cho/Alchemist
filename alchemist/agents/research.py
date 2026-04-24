@@ -1077,7 +1077,14 @@ class ResearchAgent:
 
             if task_meta.task_type != "classification":
                 # ── Non-classification R1: model + config sweep ──
-                gpu_model = select_model_for_gpu(task_meta)
+                # Query remote GPU memory if executor supports it
+                remote_gpu_gb = None
+                if hasattr(self, 'executor') and hasattr(self.executor, 'get_remote_gpu_gb'):
+                    try:
+                        remote_gpu_gb = self.executor.get_remote_gpu_gb()
+                    except Exception:
+                        pass
+                gpu_model = select_model_for_gpu(task_meta, gpu_gb=remote_gpu_gb)
                 base_cfg = dict(task_meta.default_config)
                 base_cfg["base_model"] = gpu_model
 
@@ -1500,7 +1507,13 @@ class ResearchAgent:
         if task_meta.task_type != "classification":
             # Non-classification: use registry defaults + GPU-optimal model
             base_config = dict(task_meta.default_config)
-            gpu_model = select_model_for_gpu(task_meta)
+            remote_gpu_gb = None
+            if hasattr(self, 'executor') and hasattr(self.executor, 'get_remote_gpu_gb'):
+                try:
+                    remote_gpu_gb = self.executor.get_remote_gpu_gb()
+                except Exception:
+                    pass
+            gpu_model = select_model_for_gpu(task_meta, gpu_gb=remote_gpu_gb)
             if gpu_model:
                 base_config["base_model"] = gpu_model
                 # Adjust batch size for larger models

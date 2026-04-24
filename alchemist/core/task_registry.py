@@ -415,35 +415,44 @@ TASK_REGISTRY["vlm"] = TaskTypeMeta(
 
 # ─── Utility: select model for GPU ───────────────────────────────────────────
 
-def select_model_for_gpu(task_meta: TaskTypeMeta) -> str:
-    """Select the largest model that fits the available GPU."""
+def select_model_for_gpu(task_meta: TaskTypeMeta, gpu_gb: float | None = None) -> str:
+    """Select the largest model that fits the available GPU.
+
+    Args:
+        task_meta: Task metadata with gpu_model_tiers.
+        gpu_gb: GPU memory in GB. If None, tries local torch.cuda first,
+                then falls back to the largest tier (assumes remote GPU is large).
+    """
     if not task_meta.gpu_model_tiers:
-        # No GPU tiers defined — use default config's base_model
         return task_meta.default_config.get("base_model", "")
 
-    try:
-        import torch
-        if torch.cuda.is_available():
-            total_gb = torch.cuda.get_properties(0).total_memory / 1e9
-        else:
-            total_gb = 0
-    except Exception:
-        total_gb = 0
+    if gpu_gb is None:
+        # Try local GPU
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gpu_gb = torch.cuda.get_properties(0).total_memory / 1e9
+        except Exception:
+            pass
 
-    if total_gb == 0:
-        # No GPU info — pick middle tier
-        sorted_tiers = sorted(task_meta.gpu_model_tiers.keys(), reverse=True)
-        mid = sorted_tiers[len(sorted_tiers) // 2]
-        model = task_meta.gpu_model_tiers[mid]
-        logger.info("[task_registry] No GPU info, defaulting to %s", model)
+    if gpu_gb is None or gpu_gb == 0:
+        # No GPU info available (likely running locally with remote executor)
+        # Default to largest tier — remote GPUs are typically large
+        largest_tier = max(task_meta.gpu_model_tiers.keys())
+        model = task_meta.gpu_model_tiers[largest_tier]
+        logger.info("[task_registry] No local GPU — assuming remote large GPU → %s", model)
         return model
 
     # Pick largest model whose tier threshold <= GPU memory
     for min_gb in sorted(task_meta.gpu_model_tiers.keys(), reverse=True):
-        if total_gb >= min_gb:
+        if gpu_gb >= min_gb:
             model = task_meta.gpu_model_tiers[min_gb]
-            logger.info("[task_registry] GPU %.0fGB → %s", total_gb, model)
+            logger.info("[task_registry] GPU %.0fGB → %s", gpu_gb, model)
             return model
+
+    # Fallback to smallest
+    smallest_tier = min(task_meta.gpu_model_tiers.keys())
+    return task_meta.gpu_model_tiers[smallest_tier]
 
     # Fallback
     return task_meta.default_config.get("base_model", "")

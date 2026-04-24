@@ -142,6 +142,26 @@ class AWSExecutor(TrainingExecutor):
         self.remote_python = remote_python
         self.poll_interval = poll_interval
         self.ssh_timeout = ssh_timeout
+        self._remote_gpu_gb: float | None = None  # cached
+
+    def get_remote_gpu_gb(self) -> float:
+        """Query remote GPU memory via SSH (cached after first call)."""
+        if self._remote_gpu_gb is not None:
+            return self._remote_gpu_gb
+        try:
+            result = self._ssh_cmd(
+                "nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits",
+                timeout=10,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                mb = float(result.stdout.strip().split("\n")[0])
+                self._remote_gpu_gb = mb / 1024.0
+                logger.info("Remote GPU: %.0fGB (%s)", self._remote_gpu_gb, self.host)
+                return self._remote_gpu_gb
+        except Exception as e:
+            logger.warning("Failed to query remote GPU: %s", e)
+        self._remote_gpu_gb = 46.0  # L40S default
+        return self._remote_gpu_gb
 
     @staticmethod
     def _select_worker(job: dict) -> str:
