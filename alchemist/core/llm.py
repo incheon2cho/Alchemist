@@ -90,7 +90,7 @@ class MockLLMClient(LLMClient):
 class ClaudeCLIClient(LLMClient):
     """LLM client that uses the Claude Code CLI (claude -p)."""
 
-    def __init__(self, model: str = "sonnet", timeout: int = 120):
+    def __init__(self, model: str = "opus", timeout: int = 300):
         self._model = model
         self._timeout = timeout
         if not shutil.which("claude"):
@@ -118,6 +118,39 @@ class ClaudeCLIClient(LLMClient):
             raise RuntimeError(
                 f"claude CLI timed out after {self._timeout}s"
             )
+
+
+class AnthropicAPIClient(LLMClient):
+    """LLM client using the Anthropic Python SDK directly.
+
+    Works on EC2 without claude CLI installed. Requires ANTHROPIC_API_KEY env var
+    or pip install anthropic.
+    """
+
+    def __init__(self, model: str = "claude-opus-4-6", timeout: int = 300):
+        self._model = model
+        self._timeout = timeout
+        try:
+            import anthropic
+            self._client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
+        except ImportError:
+            raise RuntimeError("anthropic package not installed: pip install anthropic")
+
+    def generate(self, prompt: str, system: str = "") -> str:
+        import anthropic
+        kwargs = {
+            "model": self._model,
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if system:
+            kwargs["system"] = system
+        try:
+            response = self._client.messages.create(**kwargs)
+            return response.content[0].text
+        except Exception as e:
+            logger.warning("Anthropic API error: %s", e)
+            raise RuntimeError(f"Anthropic API error: {e}")
 
 
 class CodexCLIClient(LLMClient):
