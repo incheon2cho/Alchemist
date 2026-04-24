@@ -884,16 +884,15 @@ class ResearchAgent:
             self.research_log.record("evolution", "trials_recorded", {
                 "generation": evolution.generation,
                 "summary": evolution.summarize()[:500],
-            }, round_num)
+            }, trial_num)
 
-            # 2c. Self-analyze results + SoTA gap analysis
+            # 2c. Self-analyze results + SoTA gap analysis (Claude-driven)
             analysis = self.analyze_results(
-                base_model, task, baseline, all_trials, best_score, round_num,
+                base_model, task, baseline, all_trials, best_score, trial_num,
             )
 
-            # 2c-1. SoTA gap analysis: compare with external knowledge
             gap_analysis = self.analyze_sota_gap(
-                task, best_score, sota_knowledge, all_trials, round_num,
+                task, best_score, sota_knowledge, all_trials, trial_num,
             )
             full_analysis = analysis + "\n\n" + gap_analysis
             analysis_history.append(full_analysis)
@@ -902,23 +901,19 @@ class ResearchAgent:
                 "analysis": analysis,
                 "current_best": round(best_score, 2),
                 "improvement": round(best_score - baseline, 2),
-            }, round_num)
-            self.research_log.record("analysis", "sota_gap", {
-                "gap_analysis": gap_analysis,
-                "current_best": round(best_score, 2),
-            }, round_num)
+            }, trial_num)
 
             # 2d. Decide: continue or stop?
-            budget_after_round = remaining_budget - (round_time / 3600)
+            budget_after_trial = remaining_budget - (trial_time / 3600)
             should_continue = self.should_continue_research(
-                analysis, best_score, baseline, round_num, budget_after_round,
-                self.max_trials,  # each round gets full trial budget
+                analysis, best_score, baseline, trial_num, budget_after_trial,
+                max_total_trials,
             )
             self.research_log.record("decision", "continue_or_stop", {
                 "continue": should_continue,
-                "round": round_num,
+                "trial": trial_num,
                 "best_score": round(best_score, 2),
-            }, round_num)
+            }, trial_num)
 
             if not should_continue:
                 break
@@ -947,7 +942,7 @@ class ResearchAgent:
             "best_score": round(best_trial.score, 2),
             "improvement": round(improvement, 2),
             "total_trials": len(all_trials),
-            "total_rounds": min(round_num, self.max_rounds),
+            "total_rounds": trial_num,
         })
 
         # Persist experience for future runs on similar tasks.
@@ -981,7 +976,7 @@ class ResearchAgent:
                             else ""
                         )
                     ),
-                    rounds_run=min(round_num, self.max_rounds),
+                    rounds_run=trial_num,
                     total_trials=len(all_trials),
                 )
             except Exception as e:
@@ -1007,7 +1002,7 @@ class ResearchAgent:
                 "baseline_score": baseline,
                 "improvement": improvement,
                 "trials_run": len(all_trials),
-                "rounds_run": min(round_num, self.max_rounds),
+                "rounds_run": trial_num,
                 "research_log": self.research_log.get_summary(),
             },
             episode=msg.episode,
