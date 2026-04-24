@@ -1122,6 +1122,21 @@ class ResearchAgent:
                 if prior_analysis:
                     prior_results = "\n".join(prior_analysis[-3:])
 
+                # Cross-task experience
+                cross_task_exp = ""
+                if self.experience is not None:
+                    try:
+                        past = self.experience.retrieve_similar(
+                            task.name, task.description, task.num_classes, top_k=3,
+                        )
+                        if past:
+                            cross_task_exp = (
+                                "\n## Cross-task experience (prior successful optimizations):\n"
+                                + self.experience.summarize_for_prompt(past, max_chars=1000)
+                            )
+                    except Exception:
+                        pass
+
                 prompt = (
                     f"You are a Research Agent designing the next training trial to MAXIMIZE {task.eval_metric}.\n\n"
                     f"Task: {task.description}\n"
@@ -1130,6 +1145,7 @@ class ResearchAgent:
                     f"Available models & ceilings:\n{models_info}\n\n"
                     f"Available techniques: {list(task_meta.technique_catalog.keys())[:20]}\n\n"
                     f"{upstream_context}\n"
+                    f"{cross_task_exp}\n"
                     f"Previous results:\n{prior_results or 'No previous trials (this is the first trial)'}\n\n"
                     f"Design ONE training config that maximizes {task.eval_metric}.\n"
                     f"Return ONLY JSON: {{\"base_model\": \"...\", \"epochs\": N, \"batch_size\": N, "
